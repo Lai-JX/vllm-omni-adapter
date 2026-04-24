@@ -157,6 +157,16 @@ _DIFFUSION_MODELS = {
         "pipeline_hunyuan_video_1_5_i2v",
         "HunyuanVideo15I2VPipeline",
     ),
+    "Alpamayo1_5TrajectoryPipeline": (
+        "alpamayo1_5",
+        "pipeline_alpamayo1_5",
+        "Alpamayo1_5TrajectoryPipeline",
+    ),
+    "Alpamayo1_5": (
+        "alpamayo1_5",
+        "pipeline_alpamayo1_5",
+        "Alpamayo1_5TrajectoryPipeline",
+    ),
 }
 
 

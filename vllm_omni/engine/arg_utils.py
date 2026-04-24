@@ -17,6 +17,7 @@ def _register_omni_hf_configs() -> None:
     try:
         from transformers import AutoConfig
 
+        from vllm_omni.transformers_utils.configs.alpamayo1_5 import Alpamayo1_5Config
         from vllm_omni.model_executor.models.cosyvoice3.config import CosyVoice3Config
         from vllm_omni.model_executor.models.qwen3_tts.configuration_qwen3_tts import (
             Qwen3TTSConfig,
@@ -29,6 +30,7 @@ def _register_omni_hf_configs() -> None:
         return
 
     for model_type, config_cls in [
+        ("alpamayo1_5", Alpamayo1_5Config),
         ("qwen3_tts", Qwen3TTSConfig),
         ("cosyvoice3", CosyVoice3Config),
         ("voxtral_tts", VoxtralTTSConfig),

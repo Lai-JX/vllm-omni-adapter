@@ -109,6 +109,9 @@ class StageMetadata:
     custom_process_input_func: Callable | None
     model_stage: str | None
     runtime_cfg: Any
+    prompt_rewrite_func: Callable | None = None
+    tokenizer_rewrite_func: Callable | None = None
+    request_postprocess_func: Callable | None = None
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
 
@@ -132,7 +135,10 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     stage_type: Literal["llm", "diffusion"] = getattr(stage_config, "stage_type", "llm")
     engine_args = stage_config.engine_args
     runtime_cfg = getattr(stage_config, "runtime", {})
-    engine_input_source: list[int] = getattr(stage_config, "engine_input_source", [])
+    input_sources = getattr(stage_config, "engine_input_source", None)
+    if input_sources is None:
+        input_sources = getattr(stage_config, "input_sources", [])
+    engine_input_source: list[int] = list(input_sources or [])
     final_output: bool = getattr(stage_config, "final_output", False)
     final_output_type: str | None = getattr(stage_config, "final_output_type", None)
 
@@ -144,6 +150,24 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
     if hasattr(stage_config, "custom_process_input_func"):
         mod_path, fn_name = stage_config.custom_process_input_func.rsplit(".", 1)
         custom_process_input_func = getattr(importlib.import_module(mod_path), fn_name)
+
+    prompt_rewrite_func: Callable | None = None
+    _prf_path = getattr(stage_config, "prompt_rewrite_func", None)
+    if _prf_path:
+        _mod, _fn = _prf_path.rsplit(".", 1)
+        prompt_rewrite_func = getattr(importlib.import_module(_mod), _fn)
+
+    tokenizer_rewrite_func: Callable | None = None
+    _trf_path = getattr(stage_config, "tokenizer_rewrite_func", None)
+    if _trf_path:
+        _mod, _fn = _trf_path.rsplit(".", 1)
+        tokenizer_rewrite_func = getattr(importlib.import_module(_mod), _fn)
+
+    request_postprocess_func: Callable | None = None
+    _rpf_path = getattr(stage_config, "request_postprocess_func", None)
+    if _rpf_path:
+        _mod, _fn = _rpf_path.rsplit(".", 1)
+        request_postprocess_func = getattr(importlib.import_module(_mod), _fn)
 
     prompt_expand_func: Callable | None = None
     _pef_path = getattr(stage_config, "prompt_expand_func", None)
@@ -171,6 +195,9 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             custom_process_input_func=custom_process_input_func,
             model_stage=None,
             runtime_cfg=runtime_cfg,
+            prompt_rewrite_func=prompt_rewrite_func,
+            tokenizer_rewrite_func=tokenizer_rewrite_func,
+            request_postprocess_func=request_postprocess_func,
             cfg_kv_collect_func=cfg_kv_collect_func,
         )
 
@@ -192,6 +219,9 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         custom_process_input_func=custom_process_input_func,
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
+        prompt_rewrite_func=prompt_rewrite_func,
+        tokenizer_rewrite_func=tokenizer_rewrite_func,
+        request_postprocess_func=request_postprocess_func,
         prompt_expand_func=prompt_expand_func,
     )
 

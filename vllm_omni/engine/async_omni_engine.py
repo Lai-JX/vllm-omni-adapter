@@ -420,6 +420,20 @@ class AsyncOmniEngine:
                     vllm_config=started.vllm_config,
                     renderer=input_processor.renderer,
                 )
+                if started.metadata.tokenizer_rewrite_func is not None:
+                    rewritten_tokenizer = started.metadata.tokenizer_rewrite_func(
+                        self.model,
+                        tokenizer,
+                    )
+                    if rewritten_tokenizer is not None:
+                        tokenizer = rewritten_tokenizer
+                        input_processor.renderer.tokenizer = rewritten_tokenizer
+                        if getattr(input_processor, "input_preprocessor", None) is not None:
+                            input_processor.input_preprocessor.renderer.tokenizer = rewritten_tokenizer
+                        output_processor.tokenizer = rewritten_tokenizer
+                        input_processor.renderer.clear_mm_cache()
+                        if getattr(input_processor, "input_preprocessor", None) is not None:
+                            input_processor.input_preprocessor.renderer.clear_mm_cache()
         except Exception:
             try:
                 stage_client.shutdown()
@@ -449,6 +463,8 @@ class AsyncOmniEngine:
         llm_stage_launch_lock = threading.Lock()
 
         async_chunk = self.async_chunk
+        prompt_rewrite_func = None
+        request_postprocess_func = None
         prompt_expand_func = None
         llm_stage_count = sum(
             1 for stage_cfg in self.stage_configs if getattr(stage_cfg, "stage_type", "llm") != "diffusion"
@@ -465,6 +481,10 @@ class AsyncOmniEngine:
                 for stage_id, stage_cfg in enumerate(self.stage_configs):
                     logger.info("[AsyncOmniEngine] Initializing stage %s", stage_id)
                     metadata = extract_stage_metadata(stage_cfg)
+                    if metadata.prompt_rewrite_func is not None and stage_id == 0:
+                        prompt_rewrite_func = metadata.prompt_rewrite_func
+                    if metadata.request_postprocess_func is not None and stage_id == 0:
+                        request_postprocess_func = metadata.request_postprocess_func
                     if metadata.prompt_expand_func is not None:
                         prompt_expand_func = metadata.prompt_expand_func
 
@@ -553,6 +573,8 @@ class AsyncOmniEngine:
         self.output_processors = output_processors
         self.stage_vllm_configs = stage_vllm_configs
         self.input_processor = input_processor
+        self.prompt_rewrite_func = prompt_rewrite_func
+        self.request_postprocess_func = request_postprocess_func
         self.prompt_expand_func = prompt_expand_func
         # TODO(Peiqi): Hack here
         supported_tasks: set[str] = set()
@@ -651,6 +673,13 @@ class AsyncOmniEngine:
 
         # Keep the original prompt for downstream stages (they need the raw
         # dict, e.g. for multi_modal_data).
+        if self.prompt_rewrite_func is not None and not isinstance(prompt, EngineCoreRequest):
+            try:
+                prompt = self.prompt_rewrite_func(prompt, params)
+            except Exception:
+                logger.exception("[AsyncOmniEngine] prompt_rewrite_func failed for req %s", request_id)
+                raise
+
         original_prompt = prompt
 
         stage_type = self.stage_metadata[0].get("stage_type")
@@ -670,6 +699,14 @@ class AsyncOmniEngine:
                 supported_tasks=self.supported_tasks,
                 arrival_time=arrival_time,
             )
+            if self.request_postprocess_func is not None:
+                request = self.request_postprocess_func(
+                    request=request,
+                    prompt=prompt,
+                    sampling_params=params,
+                    tokenizer=getattr(self.input_processor.renderer, "tokenizer", None),
+                    model_path=self.model,
+                )
             # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
             # additional_information field in the prompt.
             request = _upgrade_to_omni_request(request, prompt)
@@ -732,6 +769,14 @@ class AsyncOmniEngine:
                 params=stage0_params,
                 supported_tasks=self.supported_tasks,
             )
+            if self.request_postprocess_func is not None:
+                request = self.request_postprocess_func(
+                    request=request,
+                    prompt=companion_prompt,
+                    sampling_params=stage0_params,
+                    tokenizer=getattr(self.input_processor, "tokenizer", None),
+                    model_path=self.model,
+                )
             request = _upgrade_to_omni_request(request, companion_prompt)
             request.external_req_id = cid
 

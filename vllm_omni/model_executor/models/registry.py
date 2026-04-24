@@ -5,6 +5,11 @@ from vllm.model_executor.models.registry import (
 )
 
 _OMNI_MODELS = {
+    "Alpamayo1_5Qwen3VLForConditionalGeneration": (
+        "alpamayo1_5",
+        "alpamayo1_5_qwen3vl",
+        "Alpamayo1_5Qwen3VLForConditionalGeneration",
+    ),
     "Qwen2_5OmniForConditionalGeneration": (
         "qwen2_5_omni",
         "qwen2_5_omni",

@@ -66,6 +66,9 @@ class StageConfig:
 
     input_sources: list[int] = field(default_factory=list)
     custom_process_input_func: str | None = None
+    prompt_rewrite_func: str | None = None
+    tokenizer_rewrite_func: str | None = None
+    request_postprocess_func: str | None = None
     final_output: bool = False
     final_output_type: str | None = None  # "text", "audio", "image"
     worker_type: str | None = None  # "ar" or "generation"
@@ -142,6 +145,12 @@ class StageConfig:
 
         if self.custom_process_input_func:
             config_dict["custom_process_input_func"] = self.custom_process_input_func
+        if self.prompt_rewrite_func:
+            config_dict["prompt_rewrite_func"] = self.prompt_rewrite_func
+        if self.tokenizer_rewrite_func:
+            config_dict["tokenizer_rewrite_func"] = self.tokenizer_rewrite_func
+        if self.request_postprocess_func:
+            config_dict["request_postprocess_func"] = self.request_postprocess_func
 
         # Pass through extra YAML fields (default_sampling_params,
         # output_connectors, input_connectors, tts_args, etc.)
@@ -238,6 +247,7 @@ class StageConfigFactory:
         "glm-image": "glm_image",
         "cosyvoice3": "cosyvoice3",
         "mammothmoda2": "mammoth_moda2",
+        "alpamayo1_5": "alpamayo1_5",
     }
 
     # Fallback: map HF architecture class names to pipeline dirs.
@@ -246,6 +256,8 @@ class StageConfigFactory:
     _ARCHITECTURE_MODELS: dict[str, str] = {
         "MiMoAudioForConditionalGeneration": "mimo_audio",
         "HunyuanImage3ForCausalMM": "hunyuan_image3",
+        "Alpamayo1_5": "alpamayo1_5",
+        "Alpamayo1_5ForConditionalGeneration": "alpamayo1_5",
     }
 
     @classmethod
@@ -395,6 +407,9 @@ class StageConfigFactory:
         "input_sources",
         "engine_input_source",
         "custom_process_input_func",
+        "prompt_rewrite_func",
+        "tokenizer_rewrite_func",
+        "request_postprocess_func",
         "final_output",
         "final_output_type",
         "worker_type",
@@ -472,6 +487,9 @@ class StageConfigFactory:
                 stage_type=stage_type,
                 input_sources=input_sources,
                 custom_process_input_func=stage_data.get("custom_process_input_func", None),
+                prompt_rewrite_func=stage_data.get("prompt_rewrite_func", None),
+                tokenizer_rewrite_func=stage_data.get("tokenizer_rewrite_func", None),
+                request_postprocess_func=stage_data.get("request_postprocess_func", None),
                 final_output=stage_data.get("final_output", False),
                 final_output_type=stage_data.get("final_output_type", None),
                 worker_type=worker_type,

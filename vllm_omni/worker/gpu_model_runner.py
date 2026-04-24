@@ -1,3 +1,4 @@
+import inspect
 import sys
 from typing import TYPE_CHECKING, Any, cast
 
@@ -157,15 +158,23 @@ class OmniGPUModelRunner(GPUModelRunner):
         if supports_mrope(self.get_model()):
             # Model implements SupportsMRoPE interface
             # Pass all extracted metadata; models use what they need via **kwargs
-            req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
+            mrope_fn = self.model.get_mrope_input_positions
+            mrope_kwargs = {
+                "mm_features": req_state.mm_features,
+                "hf_config": self.model_config.hf_config,
+                "image_grid_thw": image_grid_thw,
+                "video_grid_thw": video_grid_thw,
+                "second_per_grid_ts": second_per_grid_ts,
+                "audio_feature_lengths": audio_feature_lengths,
+                "use_audio_in_video": use_audio_in_video,
+            }
+            mrope_sig = inspect.signature(mrope_fn)
+            accepted_kwargs = {
+                key: value for key, value in mrope_kwargs.items() if key in mrope_sig.parameters
+            }
+            req_state.mrope_positions, req_state.mrope_position_delta = mrope_fn(
                 req_state.prompt_token_ids,
-                mm_features=req_state.mm_features,
-                hf_config=self.model_config.hf_config,
-                image_grid_thw=image_grid_thw,
-                video_grid_thw=video_grid_thw,
-                second_per_grid_ts=second_per_grid_ts,
-                audio_feature_lengths=audio_feature_lengths,
-                use_audio_in_video=use_audio_in_video,
+                **accepted_kwargs
             )
         else:
             req_state.mrope_positions, req_state.mrope_position_delta = MRotaryEmbedding.get_input_positions_tensor(

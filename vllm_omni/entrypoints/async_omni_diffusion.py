@@ -131,7 +131,8 @@ class AsyncOmniDiffusion:
                 od_config.tf_model_config = TransformerConfig()
                 od_config.update_multimodal_support()
             elif architectures and len(architectures) == 1:
-                od_config.model_class_name = architectures[0]
+                if od_config.model_class_name is None:
+                    od_config.model_class_name = architectures[0]
             else:
                 raise
 

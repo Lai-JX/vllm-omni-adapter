@@ -7,6 +7,7 @@ expects from any stage client.
 from __future__ import annotations
 
 import asyncio
+import copy
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -32,6 +33,8 @@ class StageDiffusionClient:
     """
 
     stage_type: str = "diffusion"
+    _KV_RETRY_ATTEMPTS: int = 4
+    _KV_RETRY_DELAY_S: float = 1.0
 
     def __init__(
         self,
@@ -72,7 +75,11 @@ class StageDiffusionClient:
         sampling_params: OmniDiffusionSamplingParams,
     ) -> None:
         try:
-            result = await self._engine.generate(prompt, sampling_params, request_id)
+            result = await self._generate_with_retry(
+                request_id=request_id,
+                prompt=prompt,
+                sampling_params=sampling_params,
+            )
             await self._output_queue.put(result)
         except Exception as e:
             logger.exception(
@@ -111,10 +118,11 @@ class StageDiffusionClient:
         sampling_params: OmniDiffusionSamplingParams,
     ) -> None:
         try:
-            result = await self._engine.generate_batch(
-                prompts,
-                sampling_params,
-                request_id,
+            result = await self._generate_with_retry(
+                request_id=request_id,
+                prompt=prompts,
+                sampling_params=sampling_params,
+                is_batch=True,
             )
             await self._output_queue.put(result)
         except Exception as e:
@@ -126,6 +134,62 @@ class StageDiffusionClient:
             )
         finally:
             self._tasks.pop(request_id, None)
+
+    @staticmethod
+    def _clone_sampling_params(sampling_params: OmniDiffusionSamplingParams) -> OmniDiffusionSamplingParams:
+        clone = getattr(sampling_params, "clone", None)
+        if callable(clone):
+            return clone()
+        return copy.deepcopy(sampling_params)
+
+    @staticmethod
+    def _is_missing_stage0_context_error(exc: Exception) -> bool:
+        text = str(exc)
+        return (
+            "requires transferred stage-0 KV cache and sequence context" in text
+            or "Timeout waiting for KV cache" in text
+        )
+
+    async def _generate_with_retry(
+        self,
+        request_id: str,
+        prompt: OmniPromptType | list[OmniPromptType],
+        sampling_params: OmniDiffusionSamplingParams,
+        *,
+        is_batch: bool = False,
+    ) -> OmniRequestOutput:
+        last_exc: Exception | None = None
+
+        for attempt in range(self._KV_RETRY_ATTEMPTS + 1):
+            attempt_params = self._clone_sampling_params(sampling_params)
+            try:
+                if is_batch:
+                    assert isinstance(prompt, list)
+                    return await self._engine.generate_batch(
+                        prompt,
+                        attempt_params,
+                        request_id,
+                    )
+                return await self._engine.generate(prompt, attempt_params, request_id)
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= self._KV_RETRY_ATTEMPTS or not self._is_missing_stage0_context_error(exc):
+                    raise
+
+                delay_s = self._KV_RETRY_DELAY_S * (attempt + 1)
+                logger.warning(
+                    "[StageDiffusionClient] Stage-%s req=%s missing transferred stage-0 context; "
+                    "retrying in %.1fs (%d/%d)",
+                    self.stage_id,
+                    request_id,
+                    delay_s,
+                    attempt + 1,
+                    self._KV_RETRY_ATTEMPTS,
+                )
+                await asyncio.sleep(delay_s)
+
+        assert last_exc is not None
+        raise last_exc
 
     def get_diffusion_output_async(self) -> OmniRequestOutput | None:
         try:
