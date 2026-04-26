@@ -2,7 +2,6 @@ import asyncio
 import gc
 import json
 import os
-import sys
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
@@ -12,20 +11,15 @@ import numpy as np
 import torch
 import yaml
 from transformers import AutoConfig
-from vllm import SamplingParams
-
-sys.path.insert(0, "/workspace/project/RL-learning/vllm-omni")
-sys.path.insert(0, "/workspace/project/RL-learning/alpamayo1.5/src")
 
 from alpamayo1_5 import helper
 from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
 from alpamayo1_5.models.alpamayo1_5 import ExpertLogitsProcessor
 from alpamayo1_5.models.token_utils import StopAfterEOS, replace_padding_after_eos, to_special_token
-from tests.diffusion.models.alpamoya.custom_test import alpamoya_2stage_test as t
+import common as ct
 from vllm_omni.debug.compare_request_state_dump import compare_dump_files
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding
 from vllm_omni.model_executor.stage_input_processors.alpamayo1_5 import (
     build_alpamayo_fused_tokenized_data,
@@ -40,21 +34,7 @@ FIXED_X0_SHAPE = (1, 64, 2)
 
 
 def load_shared_data():
-    clip_msg = t.get_clip_msg(t.CLIP_ID)
-    data = t.load_physical_aiavdataset(
-        clip_id=t.CLIP_ID,
-        t0_us=t.T0_US,
-        ncore_manifest_path=clip_msg["ncore_manifest_path"],
-        ncore_root=clip_msg["ncore_root"],
-        extract_cache_dir=clip_msg["extract_cache_dir"],
-    )
-    image_frames = data["image_frames"]
-    frames = image_frames.flatten(0, 1)
-    messages = helper.create_message(
-        frames=frames,
-        camera_indices=data["camera_indices"],
-    )
-    return data, frames, messages
+    return ct.load_shared_data(use_helper_messages=True)
 
 
 def extract_cot_body(text: str) -> str:
@@ -94,41 +74,15 @@ def build_fixed_initial_noise_x0(
 
 
 def build_stage_params(tokenizer):
-    future_start_token_id = int(tokenizer.traj_token_ids["future_start"])
-    pad_token_id = int(tokenizer.pad_token_id)
-    stage0_params = SamplingParams(
-        temperature=0.6,
-        top_p=0.98,
-        top_k=40,
-        max_tokens=256,
-        stop_token_ids=[pad_token_id],
-        detokenize=False,
-        seed=42,
-        n=1,
-        extra_args={
-            "alpamayo_stop_after_token_id": future_start_token_id,
-            "alpamayo_forced_stop_token_id": pad_token_id,
-        },
-    )
-    stage1_params = OmniDiffusionSamplingParams(
-        seed=42,
-        num_outputs_per_prompt=1,
-        num_inference_steps=10,
-        guidance_scale=7.5,
-    )
-    return stage0_params, stage1_params
+    return ct.build_stage_params(tokenizer)
 
 
 def _reference_additional_information(data):
-    return {
-        "ego_history_xyz": data["ego_history_xyz"].cpu(),
-        "ego_history_rot": data["ego_history_rot"].cpu(),
-        "alpamayo_model_path": t.MODEL_PATH,
-    }
+    return ct.build_additional_information(data)
 
 
 def load_reference_hf_config():
-    config_path = Path(t.MODEL_PATH) / "config.json"
+    config_path = Path(ct.MODEL_PATH) / "config.json"
     with config_path.open("r") as f:
         alpamayo_cfg = json.load(f)
     return AutoConfig.from_pretrained(
@@ -235,9 +189,9 @@ def capture_stage1_transition_dump(base_dir: Path):
 
 def write_reference_request_dumps(base_dir: Path) -> dict[str, Path]:
     data, _, messages = load_shared_data()
-    tokenizer = build_alpamayo_stage0_tokenizer(t.MODEL_PATH)
+    tokenizer = build_alpamayo_stage0_tokenizer(ct.MODEL_PATH)
     tokenized = build_alpamayo_fused_tokenized_data(
-        t.MODEL_PATH,
+        ct.MODEL_PATH,
         messages,
         ego_history_xyz=data["ego_history_xyz"],
         ego_history_rot=data["ego_history_rot"],
@@ -427,7 +381,7 @@ def run_original(
     np.random.seed(42)
     torch.cuda.manual_seed_all(42)
 
-    model = Alpamayo1_5.from_pretrained(t.MODEL_PATH, dtype=torch.bfloat16).to("cuda")
+    model = Alpamayo1_5.from_pretrained(ct.MODEL_PATH, dtype=torch.bfloat16).to("cuda")
     processor = helper.get_processor(model.tokenizer)
 
     inputs = processor.apply_chat_template(
@@ -708,17 +662,17 @@ async def run_omni(
     initial_noise_x0: torch.Tensor | None = None,
 ):
     data, frames, messages = load_shared_data()
-    yaml_path = t.build_two_stage_yaml(t.YAML_PATH)
+    yaml_path = ct.build_two_stage_yaml(ct.YAML_PATH)
     yaml_config = yaml.safe_load(Path(yaml_path).read_text())
-    tokenizer = build_alpamayo_stage0_tokenizer(t.MODEL_PATH)
+    tokenizer = build_alpamayo_stage0_tokenizer(ct.MODEL_PATH)
     stage0_params, stage1_params = build_stage_params(tokenizer)
     prompt_text = build_alpamayo_stage0_prompt_text(
-        t.MODEL_PATH,
+        ct.MODEL_PATH,
         messages,
         tokenizer=tokenizer,
     )
     fused_tokenized = build_alpamayo_fused_tokenized_data(
-        t.MODEL_PATH,
+        ct.MODEL_PATH,
         messages,
         ego_history_xyz=data["ego_history_xyz"],
         ego_history_rot=data["ego_history_rot"],
@@ -770,7 +724,7 @@ async def run_omni(
     prompt = {
         "prompt": prompt_text,
         "multi_modal_data": {
-            "image": [t.tensor_to_pil(frame) for frame in frames],
+            "image": [ct.tensor_to_pil(frame) for frame in frames],
         },
         "additional_information": {
             **_reference_additional_information(data),
@@ -800,7 +754,7 @@ async def run_omni(
         os.environ["VLLM_OMNI_ALPAMAYO_STAGE1_DUMP_REQ_IDS"] = REQUEST_ID
         os.environ["VLLM_OMNI_ALPAMAYO_STAGE1_DUMP_PHASES"] = "stage1_rollout_context,stage1_rollout_step0"
 
-    omni = AsyncOmni(model=t.MODEL_PATH, stage_configs_path=yaml_path)
+    omni = AsyncOmni(model=ct.MODEL_PATH, stage_configs_path=yaml_path)
     try:
         final_output = None
         async for out in omni.generate(
@@ -837,12 +791,12 @@ async def run_omni_stage1_only(
     original: dict[str, object],
     dump_dir: Path | None = None,
 ):
-    yaml_path = t.build_two_stage_yaml(t.YAML_PATH)
+    yaml_path = ct.build_two_stage_yaml(ct.YAML_PATH)
     yaml_config = yaml.safe_load(Path(yaml_path).read_text())
     stage1_cfg = dict(yaml_config["stage_args"][1].get("engine_args", {}))
     stage1_cfg["gpu_memory_utilization"] = min(float(stage1_cfg.get("gpu_memory_utilization", 0.15)), 0.15)
 
-    tokenizer = build_alpamayo_stage0_tokenizer(t.MODEL_PATH)
+    tokenizer = build_alpamayo_stage0_tokenizer(ct.MODEL_PATH)
     _, stage1_params = build_stage_params(tokenizer)
     stage1_params.need_kv_receive = False
     stage1_params.past_key_values = original["prompt_cache"]
@@ -863,7 +817,7 @@ async def run_omni_stage1_only(
         os.environ["VLLM_OMNI_ALPAMAYO_STAGE1_DUMP_PHASES"] = "stage1_rollout_context,stage1_rollout_step0"
         write_actual_stage1_transition_dump(dump_dir, original["stage0_debug"])
 
-    diffusion = AsyncOmniDiffusion(model=t.MODEL_PATH, batch_size=1, **stage1_cfg)
+    diffusion = AsyncOmniDiffusion(model=ct.MODEL_PATH, batch_size=1, **stage1_cfg)
     try:
         result = await diffusion.generate(
             prompt=prompt,

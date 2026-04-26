@@ -1,87 +1,36 @@
 import asyncio
-import sys
 from pathlib import Path
 
 import numpy as np
 import torch
-from vllm import SamplingParams
-
-sys.path.insert(0, "/workspace/project/RL-learning/vllm-omni")
-sys.path.insert(0, "/workspace/project/RL-learning/alpamayo1.5/src")
-
-from tests.diffusion.models.alpamoya.custom_test import alpamoya_2stage_test as t
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.model_executor.stage_input_processors.alpamayo1_5 import (
-    build_alpamayo_stage0_prompt_text,
+from common import (
+    MODEL_PATH,
     build_alpamayo_stage0_tokenizer,
+    build_prompt_from_messages,
+    build_stage_params,
+    build_two_stage_yaml,
+    load_shared_data,
 )
 
 
 def build_request():
-    two_stage_yaml_path = t.build_two_stage_yaml(t.YAML_PATH)
-    clip_msg = t.get_clip_msg(t.CLIP_ID)
-    data = t.load_physical_aiavdataset(
-        clip_id=t.CLIP_ID,
-        t0_us=t.T0_US,
-        ncore_manifest_path=clip_msg["ncore_manifest_path"],
-        ncore_root=clip_msg["ncore_root"],
-        extract_cache_dir=clip_msg["extract_cache_dir"],
-    )
-
-    image_frames = data["image_frames"]
-    frames = image_frames.flatten(0, 1)
-    prompt_messages = t.build_prompt_messages(
-        camera_indices=data["camera_indices"],
-        num_frames_per_camera=int(image_frames.shape[1]),
-    )
-    tokenizer = build_alpamayo_stage0_tokenizer(t.MODEL_PATH)
-    future_start_token_id = int(tokenizer.traj_token_ids["future_start"])
-    pad_token_id = int(tokenizer.pad_token_id)
-    prompt_text = build_alpamayo_stage0_prompt_text(
-        t.MODEL_PATH,
+    two_stage_yaml_path = build_two_stage_yaml()
+    data, frames, prompt_messages = load_shared_data()
+    tokenizer = build_alpamayo_stage0_tokenizer(MODEL_PATH)
+    prompt, _ = build_prompt_from_messages(
         prompt_messages,
+        data=data,
+        frames=frames,
         tokenizer=tokenizer,
     )
-
-    prompt = {
-        "prompt": prompt_text,
-        "multi_modal_data": {
-            "image": [t.tensor_to_pil(frame) for frame in frames],
-        },
-        "additional_information": {
-            "ego_history_xyz": data["ego_history_xyz"].cpu(),
-            "ego_history_rot": data["ego_history_rot"].cpu(),
-            "alpamayo_model_path": t.MODEL_PATH,
-        },
-    }
-
-    stage0_params = SamplingParams(
-        temperature=0.6,
-        top_p=0.98,
-        top_k=40,
-        max_tokens=256,
-        stop_token_ids=[pad_token_id],
-        detokenize=False,
-        seed=42,
-        n=1,
-        extra_args={
-            "alpamayo_stop_after_token_id": future_start_token_id,
-            "alpamayo_forced_stop_token_id": pad_token_id,
-        },
-    )
-    stage1_params = OmniDiffusionSamplingParams(
-        seed=42,
-        num_outputs_per_prompt=1,
-        num_inference_steps=10,
-        guidance_scale=7.5,
-    )
+    stage0_params, stage1_params = build_stage_params(tokenizer)
     return two_stage_yaml_path, tokenizer, prompt, stage0_params, stage1_params
 
 
 async def run_once(tag: str):
     yaml_path, tokenizer, prompt, stage0_params, stage1_params = build_request()
-    omni = AsyncOmni(model=t.MODEL_PATH, stage_configs_path=yaml_path)
+    omni = AsyncOmni(model=MODEL_PATH, stage_configs_path=yaml_path)
     try:
         final_output = None
         async for out in omni.generate(

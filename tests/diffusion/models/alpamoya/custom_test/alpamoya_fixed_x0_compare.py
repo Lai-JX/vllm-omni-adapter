@@ -1,16 +1,12 @@
 import asyncio
 import gc
-import sys
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
 
-sys.path.insert(0, "/workspace/project/RL-learning/vllm-omni")
-sys.path.insert(0, "/workspace/project/RL-learning/alpamayo1.5/src")
-
-from tests.diffusion.models.alpamoya.custom_test.alpamoya_compare_original import (
+from alpamoya_compare_original import (
     REQUEST_ID,
     build_fixed_initial_noise_x0,
     compare_tensors,

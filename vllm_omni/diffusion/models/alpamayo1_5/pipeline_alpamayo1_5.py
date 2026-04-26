@@ -5,18 +5,22 @@ from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-import sys
 
 import torch
 import torch.nn as nn
-from transformers.cache_utils import DynamicCache
 from transformers import AutoConfig, AutoModel
+from transformers.cache_utils import DynamicCache
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.logger import init_logger
 
 from vllm_omni.debug.alpamayo_stage1_rollout_dump import maybe_dump_alpamayo_stage1_rollout
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.models.alpamayo1_5.runtime import (
+    FlowMatching,
+    PerWaypointActionInProjV2,
+    UnicycleAccelCurvatureActionSpace,
+)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
@@ -142,13 +146,6 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
         if isinstance(cfg, SimpleNamespace):
             return getattr(cfg, key, default)
         return default
-
-    def _ensure_external_alpamayo_path(self) -> None:
-        root = Path("/workspace/project/RL-learning/alpamayo1.5/src")
-        if root.exists():
-            p = str(root)
-            if p not in sys.path:
-                sys.path.insert(0, p)
 
     @staticmethod
     def _to_tensor(x: Any, *, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor | None:
@@ -373,11 +370,6 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
         self._reference_modules_init_attempted = True
 
         try:
-            self._ensure_external_alpamayo_path()
-            from alpamayo1_5.action_space.unicycle_accel_curvature import UnicycleAccelCurvatureActionSpace
-            from alpamayo1_5.diffusion.flow_matching import FlowMatching
-            from alpamayo1_5.models.action_in_proj import PerWaypointActionInProjV2
-
             action_space_cfg = self._strip_target(self._cfg_get(self.config, "action_space_cfg") or {})
             self.action_space = UnicycleAccelCurvatureActionSpace(**action_space_cfg)
             action_dims = self.action_space.get_action_space_dims()

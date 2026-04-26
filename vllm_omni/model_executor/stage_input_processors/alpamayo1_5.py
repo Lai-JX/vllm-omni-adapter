@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -14,19 +13,17 @@ from transformers import AutoProcessor
 from vllm.inputs import TextPrompt
 
 from vllm_omni.inputs.data import OmniTextPrompt, OmniTokensPrompt
+from vllm_omni.model_executor.models.alpamayo1_5.runtime import (
+    SPECIAL_TOKENS,
+    TRAJ_TOKEN,
+    instantiate_local_hist_traj_tokenizer,
+    tokenize_history_trajectory,
+)
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ALPAMAYO_MODEL_PATH = "/share/models/Alpamayo-1.5-10B"
 _FUSION_ASSETS: dict[str, dict[str, Any]] = {}
-
-
-def _ensure_alpamayo_import_path() -> None:
-    repo_root = Path(__file__).resolve().parents[4]
-    alpamayo_src = repo_root / "alpamayo1.5" / "src"
-    alpamayo_src_str = str(alpamayo_src)
-    if alpamayo_src.is_dir() and alpamayo_src_str not in sys.path:
-        sys.path.insert(0, alpamayo_src_str)
 
 
 def _validate_stage_inputs(stage_list: list[Any], engine_input_source: list[int]) -> list[Any]:
@@ -211,26 +208,16 @@ def _load_fusion_assets(alpamayo_model_path: str) -> dict[str, Any]:
     if cached is not None:
         return cached
 
-    _ensure_alpamayo_import_path()
-
-    import hydra.utils as hyu
-
-    from alpamayo1_5.models.base_model import tokenize_history_trajectory
-
     config = _load_alpamayo_config_dict(alpamayo_model_path)
-
     traj_tokenizer_cfg = config.get("traj_tokenizer_cfg")
     hist_traj_tokenizer_cfg = config.get("hist_traj_tokenizer_cfg")
-
     traj_tokenizer = None
+
     if traj_tokenizer_cfg is not None:
-        try:
-            traj_tokenizer = hyu.instantiate(traj_tokenizer_cfg, load_weights=False)
-        except TypeError:
-            traj_tokenizer = hyu.instantiate(traj_tokenizer_cfg)
+        traj_tokenizer = instantiate_local_hist_traj_tokenizer(traj_tokenizer_cfg)
 
     if hist_traj_tokenizer_cfg is not None:
-        hist_traj_tokenizer = hyu.instantiate(hist_traj_tokenizer_cfg)
+        hist_traj_tokenizer = instantiate_local_hist_traj_tokenizer(hist_traj_tokenizer_cfg)
         hist_token_start_idx = int(config["traj_token_start_idx"])
         if traj_tokenizer is not None:
             hist_token_start_idx += int(getattr(traj_tokenizer, "vocab_size"))
@@ -402,8 +389,6 @@ def build_alpamayo_stage0_tokenizer(
 ) -> Any:
     """Build the Alpamayo-expanded tokenizer used by original inference."""
 
-    _ensure_alpamayo_import_path()
-    from alpamayo1_5.models.base_model import SPECIAL_TOKENS, TRAJ_TOKEN
     from vllm.tokenizers.hf import get_cached_tokenizer
 
     resolved_model_path = str(model_path or _DEFAULT_ALPAMAYO_MODEL_PATH)
