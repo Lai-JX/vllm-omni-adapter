@@ -14,6 +14,7 @@ from transformers import AutoConfig, AutoModel
 from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.logger import init_logger
 
+from vllm_omni.debug.alpamayo_stage1_rollout_dump import maybe_dump_alpamayo_stage1_rollout
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.request import OmniDiffusionRequest
@@ -217,6 +218,19 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             return int(data) == token_id
         except (TypeError, ValueError):
             return False
+
+    @staticmethod
+    def _describe_debug_value(value: Any) -> str:
+        if value is None:
+            return "None"
+        if isinstance(value, torch.Tensor):
+            return (
+                f"Tensor(shape={tuple(value.shape)}, dtype={value.dtype}, "
+                f"device={value.device})"
+            )
+        if isinstance(value, (list, tuple)):
+            return f"{type(value).__name__}(len={len(value)})"
+        return type(value).__name__
 
     @staticmethod
     def _as_hist_xyz(x: torch.Tensor | None, device: torch.device) -> torch.Tensor:
@@ -461,34 +475,61 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
         sampling_params: Any,
         total_samples: int,
         device: torch.device,
-    ) -> tuple[torch.Tensor, DynamicCache, torch.Tensor, torch.Tensor] | None:
+    ) -> tuple[
+        torch.Tensor,
+        DynamicCache,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         transferred_kv = getattr(sampling_params, "past_key_values", None)
         if transferred_kv is None:
-            return None
+            raise RuntimeError(
+                "Missing stage-0 KV cache: sampling_params.past_key_values is None."
+            )
 
         sequences = info.get("stage0_sequences")
-        prompt_ids = list(info.get("stage0_prompt_token_ids") or [])
-        output_ids = info.get("stage0_output_token_ids") or []
-        rebuilt_sequences: Any = None
-        if isinstance(output_ids, (list, tuple)) and output_ids and isinstance(output_ids[0], (list, tuple, torch.Tensor)):
-            rebuilt_sequences = [prompt_ids + list(ids) for ids in output_ids]
-        elif prompt_ids or output_ids:
-            rebuilt_sequences = prompt_ids + list(output_ids)
-
         if sequences is None:
-            sequences = rebuilt_sequences
-        elif rebuilt_sequences is not None:
-            has_future_start = self._contains_token_id(sequences, self.future_start_id)
-            rebuilt_has_future_start = self._contains_token_id(rebuilt_sequences, self.future_start_id)
-            if not has_future_start and rebuilt_has_future_start:
-                sequences = rebuilt_sequences
+            prompt_ids_raw = info.get("stage0_prompt_token_ids")
+            if isinstance(prompt_ids_raw, torch.Tensor):
+                prompt_ids = prompt_ids_raw.detach().cpu().reshape(-1).tolist()
+            elif prompt_ids_raw is None:
+                prompt_ids = []
+            else:
+                prompt_ids = list(prompt_ids_raw)
+
+            output_ids = info.get("stage0_output_token_ids")
+            if isinstance(output_ids, torch.Tensor):
+                output_ids = output_ids.detach().cpu().tolist()
+            elif output_ids is None:
+                output_ids = []
+            else:
+                output_ids = list(output_ids)
+
+            if isinstance(output_ids, list) and output_ids and isinstance(output_ids[0], (list, tuple, torch.Tensor)):
+                sequences = [prompt_ids + list(ids) for ids in output_ids]
+            elif prompt_ids or output_ids:
+                sequences = prompt_ids + list(output_ids)
+
+        assert self._contains_token_id(sequences, self.future_start_id), (
+            "Stage-0 rollout sequence must contain future_start_id. "
+            f"future_start_id={self.future_start_id}, "
+            f"stage0_sequences={self._describe_debug_value(info.get('stage0_sequences'))}, "
+            f"stage0_prompt_token_ids={self._describe_debug_value(info.get('stage0_prompt_token_ids'))}, "
+            f"stage0_output_token_ids={self._describe_debug_value(info.get('stage0_output_token_ids'))}."
+        )
         sequence_tensor = self._to_padded_long_tensor(
             sequences,
             device=device,
             pad_value=self.future_end_id if self.future_end_id >= 0 else 0,
         )
         if sequence_tensor is None:
-            return None
+            raise RuntimeError(
+                "Failed to build stage-0 sequence tensor for rollout context. "
+                f"stage0_sequences={self._describe_debug_value(info.get('stage0_sequences'))}, "
+                f"stage0_prompt_token_ids={self._describe_debug_value(info.get('stage0_prompt_token_ids'))}, "
+                f"stage0_output_token_ids={self._describe_debug_value(info.get('stage0_output_token_ids'))}."
+            )
         if sequence_tensor.shape[0] == 1 and total_samples > 1:
             sequence_tensor = sequence_tensor.expand(total_samples, -1).contiguous()
 
@@ -498,7 +539,13 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             device=device,
         )
         if prompt_cache is None:
-            return None
+            raise RuntimeError(
+                "Failed to rebuild transferred stage-0 KV cache. "
+                f"past_key_values={type(transferred_kv).__name__}, "
+                f"key_cache={self._describe_debug_value(getattr(transferred_kv, 'key_cache', None))}, "
+                f"value_cache={self._describe_debug_value(getattr(transferred_kv, 'value_cache', None))}, "
+                f"total_samples={total_samples}."
+            )
 
         rope_deltas = self._to_tensor(info.get("stage0_rope_deltas"), device=device, dtype=torch.long)
         if rope_deltas is None:
@@ -523,20 +570,57 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             if prefix_mask_tensor.shape[0] == 1 and total_samples > 1:
                 prefix_mask_tensor = prefix_mask_tensor.expand(total_samples, -1).contiguous()
 
-        return sequence_tensor, prompt_cache, rope_deltas, prefix_mask_tensor
+        initial_noise_x0 = self._to_tensor(
+            info.get("initial_noise_x0"),
+            device=device,
+            dtype=torch.float32,
+        )
+        if initial_noise_x0 is not None:
+            if initial_noise_x0.ndim == 2:
+                initial_noise_x0 = initial_noise_x0.unsqueeze(0)
+            if initial_noise_x0.shape[0] == 1 and total_samples > 1:
+                initial_noise_x0 = initial_noise_x0.expand(total_samples, -1, -1).contiguous()
 
-    @staticmethod
-    def _diffusion_seed_context(
-        sampling_params: Any,
+        return (
+            sequence_tensor,
+            prompt_cache,
+            rope_deltas,
+            prefix_mask_tensor,
+            initial_noise_x0,
+        )
+
+    def _sample_diffusion_euler(
+        self,
+        *,
+        batch_size: int,
+        step_fn: Any,
         device: torch.device,
-    ):
-        seed = getattr(sampling_params, "seed", None)
-        if seed is None:
-            return nullcontext()
-        if device.type == "cuda":
-            device_index = device.index if device.index is not None else torch.cuda.current_device()
-            return torch.random.fork_rng(devices=[device_index])
-        return torch.random.fork_rng()
+        inference_step: int,
+        generator: torch.Generator | None,
+        initial_noise_x0: torch.Tensor | None,
+        temperature: float = 1.0,
+    ) -> torch.Tensor:
+        assert self.diffusion is not None
+        if initial_noise_x0 is not None:
+            x = initial_noise_x0.to(device=device, dtype=torch.float32).contiguous()
+        else:
+            x = torch.randn(
+                batch_size,
+                *self.diffusion.x_dims,
+                device=device,
+                generator=generator,
+            ) * temperature
+        time_steps = torch.linspace(0.0, 1.0, inference_step + 1, device=device)
+        n_dim = len(self.diffusion.x_dims)
+
+        for i in range(inference_step):
+            dt = time_steps[i + 1] - time_steps[i]
+            dt = dt.view(1, *[1] * n_dim).expand(batch_size, *[1] * n_dim)
+            t_start = time_steps[i].view(1, *[1] * n_dim).expand(batch_size, *[1] * n_dim)
+            v = step_fn(x=x, t=t_start)
+            x = x + dt * v
+
+        return x
 
     def _resolve_future_steps(self, info: dict[str, Any]) -> int:
         action_space_cfg = info.get("action_space_cfg")
@@ -562,6 +646,7 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
 
     def _sample_with_rollout_context(
         self,
+        req_id: str,
         info: dict[str, Any],
         sampling_params: Any,
         hist_xyz: torch.Tensor,
@@ -592,13 +677,25 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             total_samples=total_samples,
             device=hist_xyz.device,
         )
-        if prepared is None:
-            raise RuntimeError(
-                "Alpamayo1_5 diffusion stage requires transferred stage-0 KV cache and sequence context."
-            )
-        sequence_tensor, prompt_cache, rope_deltas, prefix_mask = prepared
+        (
+            sequence_tensor,
+            prompt_cache,
+            rope_deltas,
+            prefix_mask,
+            initial_noise_x0,
+        ) = prepared
         prefill_seq_len = prompt_cache.get_seq_length()
         n_diffusion_tokens = self.action_space.get_action_space_dims()[0]
+        expected_x_shape = tuple(int(dim) for dim in self.diffusion.x_dims)
+        if initial_noise_x0 is not None:
+            actual_x_shape = tuple(int(dim) for dim in initial_noise_x0.shape)
+            if actual_x_shape != (total_samples, *expected_x_shape):
+                raise RuntimeError(
+                    "Invalid Alpamayo initial_noise_x0 shape for stage-1 rollout. "
+                    f"expected={(total_samples, *expected_x_shape)}, "
+                    f"got={actual_x_shape}, "
+                    f"req_id={req_id}."
+                )
         offset = self._find_eos_offset(
             sequences=sequence_tensor,
             eos_token_id=self.future_start_id,
@@ -614,52 +711,119 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             device=hist_xyz.device,
             prefix_mask=prefix_mask,
         )
+        maybe_dump_alpamayo_stage1_rollout(
+            req_id=req_id,
+            phase="stage1_rollout_context",
+            payload={
+                "sequence_tensor": sequence_tensor,
+                "rope_deltas": rope_deltas,
+                "prefix_mask": prefix_mask,
+                "prefill_seq_len": int(prefill_seq_len),
+                "offset": offset,
+                "position_ids": position_ids,
+                "attention_mask": attention_mask,
+                "hist_xyz": hist_xyz,
+                "hist_rot": hist_rot,
+                "hist_xyz_rep": hist_xyz_rep,
+                "hist_rot_rep": hist_rot_rep,
+                "future_steps": int(future_steps),
+                "num_inference_steps": int(num_inference_steps),
+                "guidance_scale": float(guidance_scale),
+                "future_start_id": int(self.future_start_id),
+                "initial_noise_x0": initial_noise_x0,
+            },
+        )
 
         forward_kwargs: dict[str, Any] = {}
         if bool(self._cfg_get(self.config, "expert_non_causal_attention", True)):
             forward_kwargs["is_causal"] = False
 
-        action_in_proj_param = next(self.action_in_proj.parameters(), None)
-        action_in_proj_device = action_in_proj_param.device if action_in_proj_param is not None else hist_xyz.device
-        action_in_proj_dtype = action_in_proj_param.dtype if action_in_proj_param is not None else hist_xyz.dtype
         expert_param = next(self.expert.parameters(), None)
-        expert_dtype = expert_param.dtype if expert_param is not None else action_in_proj_dtype
-        attention_mask = attention_mask.to(dtype=expert_dtype)
+        expert_dtype = expert_param.dtype if expert_param is not None else hist_xyz.dtype
+        first_step_dumped = False
 
         def step_fn(*, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-            x = x.to(device=action_in_proj_device, dtype=action_in_proj_dtype)
-            t = t.to(device=action_in_proj_device, dtype=action_in_proj_dtype)
-            future_token_embeds = self.action_in_proj(x, t)
-            if future_token_embeds.dim() == 2:
-                future_token_embeds = future_token_embeds.view(total_samples, n_diffusion_tokens, -1)
-            expert_out = self.expert(
-                inputs_embeds=future_token_embeds,
-                position_ids=position_ids,
-                past_key_values=prompt_cache,
-                attention_mask=attention_mask,
-                use_cache=True,
-                **forward_kwargs,
-            )
+            nonlocal first_step_dumped
+            raw_x = x
+            raw_t = t
+            x = x.to(device=hist_xyz.device)
+            t = t.to(device=hist_xyz.device)
+
+            autocast_ctx = nullcontext()
+            if hist_xyz.device.type == "cuda" and expert_dtype in (torch.float16, torch.bfloat16):
+                autocast_ctx = torch.autocast(device_type="cuda", dtype=expert_dtype)
+
+            with autocast_ctx:
+                future_token_embeds = self.action_in_proj(x, t)
+                if future_token_embeds.dim() == 2:
+                    future_token_embeds = future_token_embeds.view(total_samples, n_diffusion_tokens, -1)
+                expert_out = self.expert(
+                    inputs_embeds=future_token_embeds,
+                    position_ids=position_ids,
+                    past_key_values=prompt_cache,
+                    attention_mask=attention_mask,
+                    use_cache=True,
+                    **forward_kwargs,
+                )
             prompt_cache.crop(prefill_seq_len)
             last_hidden = expert_out.last_hidden_state[:, -n_diffusion_tokens:]
-            return self.action_out_proj(last_hidden).view(
-                -1,
-                *self.action_space.get_action_space_dims(),
-            )
+            with autocast_ctx:
+                pred = self.action_out_proj(last_hidden).view(
+                    -1,
+                    *self.action_space.get_action_space_dims(),
+                )
+            if not first_step_dumped:
+                maybe_dump_alpamayo_stage1_rollout(
+                    req_id=req_id,
+                    phase="stage1_rollout_step0",
+                    payload={
+                        "x": raw_x,
+                        "t": raw_t,
+                        "x_cast": x,
+                        "t_cast": t,
+                        "future_token_embeds": future_token_embeds,
+                        "last_hidden": last_hidden,
+                        "pred": pred,
+                    },
+                )
+                first_step_dumped = True
+            return pred
 
-        with self._diffusion_seed_context(sampling_params, hist_xyz.device):
-            seed = getattr(sampling_params, "seed", None)
-            if seed is not None:
-                torch.manual_seed(int(seed))
-            sampled_action = self.diffusion.sample(
+        seed = getattr(sampling_params, "seed", None)
+        diffusion_generator = None
+        if seed is not None:
+            diffusion_generator = torch.Generator(device=hist_xyz.device)
+            diffusion_generator.manual_seed(int(seed))
+
+        if diffusion_generator is not None:
+            sampled_action = self._sample_diffusion_euler(
                 batch_size=total_samples,
                 step_fn=step_fn,
                 device=hist_xyz.device,
-                return_all_steps=False,
                 inference_step=num_inference_steps,
-                inference_guidance_weight=guidance_scale,
-                use_classifier_free_guidance=False,
+                generator=diffusion_generator,
+                initial_noise_x0=initial_noise_x0,
             )
+        else:
+            if initial_noise_x0 is not None:
+                sampled_action = self._sample_diffusion_euler(
+                    batch_size=total_samples,
+                    step_fn=step_fn,
+                    device=hist_xyz.device,
+                    inference_step=num_inference_steps,
+                    generator=None,
+                    initial_noise_x0=initial_noise_x0,
+                )
+            else:
+                sampled_action = self.diffusion.sample(
+                    batch_size=total_samples,
+                    step_fn=step_fn,
+                    device=hist_xyz.device,
+                    return_all_steps=False,
+                    inference_step=num_inference_steps,
+                    inference_guidance_weight=guidance_scale,
+                    use_classifier_free_guidance=False,
+                )
 
         pred_xyz, pred_rot = self.action_space.action_to_traj(
             sampled_action,
@@ -749,8 +913,10 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             hist_rot = self._to_tensor(info.get("ego_history_rot"), device=device)
             hist_xyz_ref = self._as_hist_xyz(hist_xyz, device)
             hist_rot_ref = self._as_hist_rot(hist_rot, hist_xyz_ref, device)
+            req_id = str(req.request_ids[0]) if getattr(req, "request_ids", None) else "unknown"
 
             pred_xyz, pred_rot = self._sample_with_rollout_context(
+                req_id=req_id,
                 info=info,
                 sampling_params=req.sampling_params,
                 hist_xyz=hist_xyz_ref,

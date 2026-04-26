@@ -33,7 +33,6 @@ from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
 
 logger = init_logger(__name__)
-_DIFFUSION_KV_FLUSH_WAIT_S = 0.5
 
 
 def build_engine_core_request_from_tokens(
@@ -86,55 +85,6 @@ def build_engine_core_request_from_tokens(
         prompt_embeds=prompt_embeds,
         additional_information=additional_info_payload,
     )
-
-
-async def _prefetch_diffusion_kv_if_needed(
-    *,
-    req_id: str,
-    stage_id: int,
-    next_client: Any,
-    params: Any,
-    has_cfg_companions: bool,
-) -> Any:
-    if not bool(getattr(params, "need_kv_receive", False)):
-        return params
-    if getattr(params, "past_key_values", None) is not None:
-        return params
-    if has_cfg_companions:
-        return params
-
-    od_config = getattr(getattr(next_client, "_engine", None), "od_config", None)
-    if od_config is None:
-        return params
-
-    from types import SimpleNamespace
-
-    from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
-
-    kv_manager = getattr(next_client, "_orchestrator_kv_transfer_manager", None)
-    if kv_manager is None:
-        kv_manager = OmniKVTransferManager.from_od_config(od_config)
-        setattr(next_client, "_orchestrator_kv_transfer_manager", kv_manager)
-
-    data, _ = await asyncio.to_thread(
-        kv_manager.receive_kv_cache_for_request,
-        req_id,
-        torch.device("cpu"),
-    )
-    if not data:
-        return params
-
-    params = copy.deepcopy(params)
-    kv_req = SimpleNamespace(request_id=req_id, sampling_params=params)
-    kv_manager.apply_kv_cache_to_request(kv_req, data)
-    params.need_kv_receive = False
-    logger.info(
-        "[Orchestrator] Prefetched stage-%s KV for req %s into diffusion sampling params",
-        stage_id,
-        req_id,
-    )
-    return params
-
 
 # ============================================================
 # Orchestrator internals (run inside the background thread)
@@ -299,6 +249,7 @@ class Orchestrator:
 
                 # 1) Poll raw outputs from the stage
                 try:
+                    # raw_outputs: EngineCoreOutputs for LLM stages, OmniRequestOutput for diffusion stage
                     raw_outputs = await asyncio.wait_for(self._poll_stage_raw(stage_id), timeout=0.001)
                 except asyncio.TimeoutError:
                     continue
@@ -506,13 +457,12 @@ class Orchestrator:
         params = req_state.sampling_params_list[next_stage_id]
 
         if next_client.stage_type == "diffusion":
-            kv_transfer_pending = getattr(output, "kv_transfer_params", None) is not None
             self.stage_clients[stage_id].set_engine_outputs([output])
             if next_client.custom_process_input_func is not None:
                 diffusion_prompt = next_client.custom_process_input_func(
                     self.stage_clients,
                     next_client.engine_input_source,
-                    req_state.prompt,
+                    req_state.prompt,   # raw_prompt
                     False,
                 )
                 if isinstance(diffusion_prompt, list):
@@ -534,22 +484,6 @@ class Orchestrator:
                         cfg_ids,
                         req_id,
                     )
-
-            if kv_transfer_pending and bool(getattr(params, "need_kv_receive", False)):
-                logger.info(
-                    "[Orchestrator] req=%s waiting %.2fs for stage-%s KV flush before diffusion handoff",
-                    req_id,
-                    _DIFFUSION_KV_FLUSH_WAIT_S,
-                    stage_id,
-                )
-                await asyncio.sleep(_DIFFUSION_KV_FLUSH_WAIT_S)
-            params = await _prefetch_diffusion_kv_if_needed(
-                req_id=req_id,
-                stage_id=stage_id,
-                next_client=next_client,
-                params=params,
-                has_cfg_companions=bool(cfg_ids),
-            )
 
             if isinstance(diffusion_prompt, list):
                 await next_client.add_batch_request_async(

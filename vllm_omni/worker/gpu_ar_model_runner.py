@@ -596,6 +596,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             end = start + sched
             hidden_slice = hidden_states_cpu[start:end]
             payload: dict[str, object] = {"hidden": hidden_slice}
+            add_info = self.model_intermediate_buffer.get(rid, {})
             if mm_cpu:
                 mm_payload: dict[str, object] = {}
                 for k, v in mm_cpu.items():
@@ -616,6 +617,20 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     else:
                         mm_payload[k] = v
                 payload.update(mm_payload)
+
+            prompt_mrope_position_delta = add_info.get("prompt_mrope_position_delta")
+            if prompt_mrope_position_delta is not None:
+                if isinstance(prompt_mrope_position_delta, torch.Tensor):
+                    prompt_mrope_position_delta = (
+                        prompt_mrope_position_delta.detach().to("cpu").contiguous()
+                    )
+                else:
+                    prompt_mrope_position_delta = torch.as_tensor(
+                        prompt_mrope_position_delta,
+                        dtype=torch.long,
+                    )
+                payload["prompt_mrope_position_delta"] = prompt_mrope_position_delta
+
             pooler_output.append(payload)
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:

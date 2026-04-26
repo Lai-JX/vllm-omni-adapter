@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import copy
 import json
 import logging
 import os
@@ -20,7 +19,6 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_ALPAMAYO_MODEL_PATH = "/share/models/Alpamayo-1.5-10B"
 _FUSION_ASSETS: dict[str, dict[str, Any]] = {}
-_BASE_TOKENIZERS: dict[str, Any] = {}
 
 
 def _ensure_alpamayo_import_path() -> None:
@@ -98,6 +96,41 @@ def _to_cpu_tensor(value: Any, *, dtype: torch.dtype | None = None) -> torch.Ten
     return tensor.contiguous()
 
 
+def _populate_missing_stage0_fields(
+    info: dict[str, Any],
+    *,
+    prompt_token_ids: list[int],
+    output_token_ids_list: list[list[int]],
+    prompt_mrope_position_delta: Any | None = None,
+) -> None:
+    prompt_length = len(prompt_token_ids)
+    tokenized_data = dict(info.get("tokenized_data") or {})
+
+    if info.get("stage0_rope_deltas") is None:
+        rope_deltas = _to_cpu_tensor(prompt_mrope_position_delta, dtype=torch.long)
+        if rope_deltas is not None:
+            if rope_deltas.ndim == 0:
+                rope_deltas = rope_deltas.view(1, 1)
+            elif rope_deltas.ndim == 1:
+                rope_deltas = rope_deltas.unsqueeze(-1).contiguous()
+            else:
+                rope_deltas = rope_deltas.view(rope_deltas.shape[0], -1)[:, :1].contiguous()
+            info["stage0_rope_deltas"] = rope_deltas
+
+    if info.get("stage0_attention_mask") is None:
+        attention_mask = _to_cpu_tensor(tokenized_data.get("attention_mask"), dtype=torch.long)
+        if attention_mask is not None:
+            info["stage0_attention_mask"] = attention_mask
+
+    if info.get("stage0_prefill_seq_len") is None:
+        if len(output_token_ids_list) == 1:
+            info["stage0_prefill_seq_len"] = max(prompt_length + len(output_token_ids_list[0]) - 1, 0)
+        else:
+            info["stage0_prefill_seq_lens"] = [
+                max(prompt_length + len(output_token_ids) - 1, 0) for output_token_ids in output_token_ids_list
+            ]
+
+
 def _resolve_runtime_token_id(tokenizer: Any, token: str) -> int | None:
     if tokenizer is None:
         return None
@@ -171,71 +204,6 @@ def build_alpamayo_mm_processor_kwargs(model_path: str) -> dict[str, int]:
         if value is not None:
             mm_processor_kwargs[key] = int(value)
     return mm_processor_kwargs
-
-
-def _get_alpamayo_base_tokenizer(model_path: str) -> Any:
-    resolved_model_path = str(model_path or _DEFAULT_ALPAMAYO_MODEL_PATH)
-    cached = _BASE_TOKENIZERS.get(resolved_model_path)
-    if cached is not None:
-        return cached
-
-    config = _load_alpamayo_config_dict(resolved_model_path)
-    tokenizer = AutoProcessor.from_pretrained(
-        config["vlm_name_or_path"],
-        trust_remote_code=True,
-        local_files_only=True,
-    ).tokenizer
-    _BASE_TOKENIZERS[resolved_model_path] = tokenizer
-    return tokenizer
-
-
-def _find_subsequence(sequence: list[int], pattern: list[int]) -> int:
-    if not pattern or len(pattern) > len(sequence):
-        return -1
-    limit = len(sequence) - len(pattern) + 1
-    for idx in range(limit):
-        if sequence[idx : idx + len(pattern)] == pattern:
-            return idx
-    return -1
-
-
-def _retokenize_stage0_traj_segment_if_needed(
-    input_ids: torch.Tensor,
-    additional_information: dict[str, Any],
-    alpamayo_model_path: str,
-    tokenizer: Any | None = None,
-) -> torch.Tensor:
-    prompt_text = additional_information.get("stage0_prompt_text") or additional_information.get("prompt")
-    if not isinstance(prompt_text, str):
-        return input_ids
-
-    marker = "<|traj_history_start|>"
-    marker_pos = prompt_text.find(marker)
-    if marker_pos < 0:
-        return input_ids
-
-    traj_text = prompt_text[marker_pos:]
-    base_tokenizer = _get_alpamayo_base_tokenizer(alpamayo_model_path)
-    target_tokenizer = tokenizer or build_alpamayo_stage0_tokenizer(alpamayo_model_path)
-
-    base_ids = list(base_tokenizer.encode(traj_text, add_special_tokens=False))
-    target_ids = list(target_tokenizer.encode(traj_text, add_special_tokens=False))
-    if not base_ids or not target_ids or base_ids == target_ids:
-        return input_ids
-
-    prompt_ids = input_ids[0].tolist()
-    start_idx = _find_subsequence(prompt_ids, base_ids)
-    if start_idx < 0:
-        return input_ids
-
-    rewritten_ids = prompt_ids[:start_idx] + target_ids + prompt_ids[start_idx + len(base_ids) :]
-    logger.info(
-        "Retokenized Alpamayo stage-0 trajectory suffix from %d to %d tokens at offset %d",
-        len(base_ids),
-        len(target_ids),
-        start_idx,
-    )
-    return torch.tensor([rewritten_ids], dtype=torch.long)
 
 
 def _load_fusion_assets(alpamayo_model_path: str) -> dict[str, Any]:
@@ -430,12 +398,10 @@ def build_alpamayo_stage0_prompt_text(
 
 
 def build_alpamayo_stage0_tokenizer(
-    model_path: str,
-    tokenizer: Any | None = None,
+    model_path: str
 ) -> Any:
     """Build the Alpamayo-expanded tokenizer used by original inference."""
 
-    del tokenizer
     _ensure_alpamayo_import_path()
     from alpamayo1_5.models.base_model import SPECIAL_TOKENS, TRAJ_TOKEN
     from vllm.tokenizers.hf import get_cached_tokenizer
@@ -482,6 +448,31 @@ def build_alpamayo_stage0_tokenizer(
                 f"{key}: expected {expected_id}, got {actual_id}"
             )
     return get_cached_tokenizer(tokenizer)
+
+
+def build_alpamayo_stage0_renderer(
+    vllm_config: Any,
+    tokenizer: Any | None = None,
+    model_path: str | None = None,
+) -> Any:
+    """Build a stage-0 renderer whose MM processor starts with Alpamayo tokenizer."""
+
+    from vllm.renderers.registry import RENDERER_REGISTRY
+    from vllm.tokenizers.registry import tokenizer_args_from_config
+
+    model_config = vllm_config.model_config
+    resolved_tokenizer = build_alpamayo_stage0_tokenizer(
+        str(model_path or model_config.model)
+    )
+
+    tokenizer_mode, _, _, _ = tokenizer_args_from_config(model_config)
+    if model_config.tokenizer_mode == "auto" and model_config.model_impl == "terratorch":
+        renderer_mode = "terratorch"
+    else:
+        renderer_mode = tokenizer_mode
+
+    renderer_cls = RENDERER_REGISTRY.load_renderer_cls(renderer_mode)
+    return renderer_cls(vllm_config, resolved_tokenizer)
 
 
 def rewrite_stage0_prompt_for_vllm_multimodal(
@@ -543,12 +534,6 @@ def postprocess_stage0_request_for_traj_fusion(
     if additional_information.get("ego_history_xyz") is None or additional_information.get("ego_history_rot") is None:
         return request
     prompt_input_ids = _as_batched_input_ids(prompt_token_ids)
-    prompt_input_ids = _retokenize_stage0_traj_segment_if_needed(
-        prompt_input_ids,
-        additional_information,
-        alpamayo_model_path,
-        tokenizer=tokenizer,
-    )
     fused_input_ids = _fuse_stage0_history_tokens(
         prompt_input_ids,
         additional_information,
@@ -575,65 +560,6 @@ def postprocess_stage0_request_for_traj_fusion(
     return request
 
 
-def rewrite_stage0_prompt_for_traj_fusion(
-    prompt: dict[str, Any] | OmniTextPrompt | OmniTokensPrompt | str,
-    sampling_params: Any,
-) -> dict[str, Any] | OmniTokensPrompt | str:
-    """Rewrite the stage-0 prompt so Qwen3VL consumes fused Alpamayo token ids.
-
-    Original Alpamayo inference tokenizes with the Alpamayo tokenizer first and
-    then replaces `<|traj_history|>` placeholders with discrete trajectory
-    tokens before VLM generation. We mirror that behavior here by converting the
-    incoming request into an `OmniTokensPrompt` carrying the fused token ids and
-    the original multimodal payload.
-    """
-
-    prompt_dict = _normalize_prompt(prompt)
-    if not prompt_dict:
-        return prompt
-
-    additional_information = _detach_payload(prompt_dict.get("additional_information") or {})
-    tokenized_data = copy.deepcopy(additional_information.get("tokenized_data") or {})
-    input_ids = tokenized_data.get("input_ids")
-    if input_ids is None:
-        return prompt
-
-    if additional_information.get("ego_history_xyz") is None or additional_information.get("ego_history_rot") is None:
-        return prompt
-
-    fused_input_ids = _as_batched_input_ids(input_ids)
-    alpamayo_model_path = _resolve_alpamayo_model_path(prompt_dict, additional_information, sampling_params)
-    fused_input_ids = _fuse_stage0_history_tokens(
-        fused_input_ids,
-        additional_information,
-        alpamayo_model_path,
-    )
-
-    tokenized_data["input_ids"] = fused_input_ids
-    additional_information["tokenized_data"] = tokenized_data
-    additional_information["stage0_fused_traj_tokens"] = True
-    additional_information["stage0_fused_prompt_length"] = int(fused_input_ids.shape[-1])
-    additional_information["alpamayo_model_path"] = alpamayo_model_path
-
-    rewritten_prompt = OmniTokensPrompt(
-        prompt_token_ids=fused_input_ids[0].tolist(),
-        additional_information=additional_information,
-    )
-
-    for key in (
-        "prompt",
-        "modalities",
-        "multi_modal_data",
-        "mm_processor_kwargs",
-        "multi_modal_uuids",
-        "cache_salt",
-    ):
-        if key in prompt_dict:
-            rewritten_prompt[key] = prompt_dict[key]
-
-    return rewritten_prompt
-
-
 def vlm2trajectory(
     stage_list: list[Any],
     engine_input_source: list[int],
@@ -643,12 +569,13 @@ def vlm2trajectory(
     """Package VLM outputs plus original trajectory context for stage 1."""
 
     del requires_multimodal_data
+    # The output of stage 0: RequestOutput
     stage_outputs = _validate_stage_inputs(stage_list, engine_input_source)
     prompts = prompt if isinstance(prompt, list) else [prompt] * len(stage_outputs)
 
     trajectory_inputs: list[OmniTextPrompt] = []
-    for i, stage_output in enumerate(stage_outputs):
-        outputs = list(stage_output.outputs or [])
+    for i, stage_output in enumerate(stage_outputs): 
+        outputs = list(stage_output.outputs or [])  # CompletionOutput
         if not outputs:
             raise RuntimeError("Stage 0 produced no completion outputs for Alpamayo trajectory rollout")
         original_prompt = _normalize_prompt(prompts[i] if i < len(prompts) else None)
@@ -688,10 +615,21 @@ def vlm2trajectory(
         if isinstance(latent, torch.Tensor):
             transformed_info["stage0_latent"] = latent.detach().cpu().to(torch.float32).contiguous()
             transformed_info["stage0_latent_shape"] = list(latent.shape)
-        for key in ("rope_deltas", "position_ids", "attention_mask"):
+        prompt_mrope_position_delta = multimodal_output.get("prompt_mrope_position_delta")
+        initial_noise_x0 = multimodal_output.get("initial_noise_x0")
+        if isinstance(initial_noise_x0, torch.Tensor):
+            transformed_info["initial_noise_x0"] = initial_noise_x0.detach().cpu().contiguous()
+        for key in ("rope_deltas", "attention_mask"):
             value = multimodal_output.get(key)
             if isinstance(value, torch.Tensor):
                 transformed_info[f"stage0_{key}"] = value.detach().cpu().contiguous()
+
+        _populate_missing_stage0_fields(
+            transformed_info,
+            prompt_token_ids=prompt_token_ids,
+            output_token_ids_list=output_token_ids_list,
+            prompt_mrope_position_delta=prompt_mrope_position_delta,
+        )
 
         trajectory_inputs.append(
             OmniTextPrompt(

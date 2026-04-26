@@ -412,7 +412,19 @@ class AsyncOmniEngine:
             )
             input_processor = None
             if started.stage_id == 0:
-                input_processor = InputProcessor(vllm_config=started.vllm_config)
+                custom_renderer = None
+                if started.metadata.renderer_rewrite_func is not None:
+                    custom_renderer = started.metadata.renderer_rewrite_func(
+                        started.vllm_config,
+                        tokenizer=tokenizer,
+                        model_path=self.model,
+                    )
+                    tokenizer = getattr(custom_renderer, "tokenizer", tokenizer)
+
+                input_processor = InputProcessor(
+                    vllm_config=started.vllm_config,
+                    renderer=custom_renderer,
+                )
                 # Use omni preprocessor so text-only prompts with
                 # mm_processor_kwargs (e.g. GLM-Image t2i target_h/target_w)
                 # still go through multimodal processor path.
@@ -420,20 +432,8 @@ class AsyncOmniEngine:
                     vllm_config=started.vllm_config,
                     renderer=input_processor.renderer,
                 )
-                if started.metadata.tokenizer_rewrite_func is not None:
-                    rewritten_tokenizer = started.metadata.tokenizer_rewrite_func(
-                        self.model,
-                        tokenizer,
-                    )
-                    if rewritten_tokenizer is not None:
-                        tokenizer = rewritten_tokenizer
-                        input_processor.renderer.tokenizer = rewritten_tokenizer
-                        if getattr(input_processor, "input_preprocessor", None) is not None:
-                            input_processor.input_preprocessor.renderer.tokenizer = rewritten_tokenizer
-                        output_processor.tokenizer = rewritten_tokenizer
-                        input_processor.renderer.clear_mm_cache()
-                        if getattr(input_processor, "input_preprocessor", None) is not None:
-                            input_processor.input_preprocessor.renderer.clear_mm_cache()
+                if custom_renderer is not None:
+                    output_processor.tokenizer = tokenizer
         except Exception:
             try:
                 stage_client.shutdown()

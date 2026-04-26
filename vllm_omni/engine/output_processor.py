@@ -3,7 +3,7 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.logger import init_logger
-from vllm.outputs import PoolingRequestOutput
+from vllm.outputs import PoolingRequestOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
@@ -16,9 +16,17 @@ from vllm.v1.engine.output_processor import (
 from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.metrics.stats import IterationStats
 
-from vllm_omni.outputs import OmniRequestOutput
+# from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+_NON_CONCAT_MM_KEYS = {
+    "attention_mask",
+    "initial_noise_x0",
+    "position_ids",
+    "prompt_mrope_position_delta",
+    "rope_deltas",
+}
 
 
 class OmniRequestState(RequestState):
@@ -85,6 +93,9 @@ class OmniRequestState(RequestState):
                     if k not in self.mm_accumulated:
                         self.mm_accumulated[k] = v
                     else:
+                        if k in _NON_CONCAT_MM_KEYS:
+                            self.mm_accumulated[k] = v
+                            continue
                         existing = self.mm_accumulated[k]
                         if isinstance(v, torch.Tensor) and isinstance(existing, torch.Tensor):
                             # Use list accumulation to avoid O(n²) repeated concatenation
@@ -117,7 +128,9 @@ class OmniRequestState(RequestState):
             for k, v in self.mm_accumulated.items():
                 if isinstance(v, list) and v and isinstance(v[0], torch.Tensor):
                     try:
-                        if k == "audio":
+                        if k in _NON_CONCAT_MM_KEYS:
+                            self.mm_accumulated[k] = v[-1]
+                        elif k == "audio":
                             # When the audio tensor shape is inconsistent, torch.cat will fail.
                             # We need to use torch.cat in -1 dimension.
                             continue
@@ -150,7 +163,7 @@ class OmniRequestState(RequestState):
         stop_reason: int | str | None,
         kv_transfer_params: dict[str, Any] | None = None,
         routed_experts: np.ndarray | None = None,
-    ) -> OmniRequestOutput | PoolingRequestOutput | None:
+    ) -> RequestOutput | PoolingRequestOutput | None:
         """Create a request output from generation results.
 
         Creates a RequestOutput or PoolingRequestOutput from the generated
@@ -165,7 +178,7 @@ class OmniRequestState(RequestState):
             kv_transfer_params: Optional KV cache transfer parameters
 
         Returns:
-            OmniRequestOutput or PoolingRequestOutput if output should be
+            RequestOutput or PoolingRequestOutput if output should be
             emitted (based on finish status and output kind), None otherwise
         """
         # Pooling-only requests should follow base behavior.

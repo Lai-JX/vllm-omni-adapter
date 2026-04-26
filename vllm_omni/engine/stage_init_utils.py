@@ -110,7 +110,7 @@ class StageMetadata:
     model_stage: str | None
     runtime_cfg: Any
     prompt_rewrite_func: Callable | None = None
-    tokenizer_rewrite_func: Callable | None = None
+    renderer_rewrite_func: Callable | None = None
     request_postprocess_func: Callable | None = None
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
@@ -157,11 +157,11 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         _mod, _fn = _prf_path.rsplit(".", 1)
         prompt_rewrite_func = getattr(importlib.import_module(_mod), _fn)
 
-    tokenizer_rewrite_func: Callable | None = None
-    _trf_path = getattr(stage_config, "tokenizer_rewrite_func", None)
-    if _trf_path:
-        _mod, _fn = _trf_path.rsplit(".", 1)
-        tokenizer_rewrite_func = getattr(importlib.import_module(_mod), _fn)
+    renderer_rewrite_func: Callable | None = None
+    _rrf_path = getattr(stage_config, "renderer_rewrite_func", None)
+    if _rrf_path:
+        _mod, _fn = _rrf_path.rsplit(".", 1)
+        renderer_rewrite_func = getattr(importlib.import_module(_mod), _fn)
 
     request_postprocess_func: Callable | None = None
     _rpf_path = getattr(stage_config, "request_postprocess_func", None)
@@ -196,7 +196,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             model_stage=None,
             runtime_cfg=runtime_cfg,
             prompt_rewrite_func=prompt_rewrite_func,
-            tokenizer_rewrite_func=tokenizer_rewrite_func,
+            renderer_rewrite_func=renderer_rewrite_func,
             request_postprocess_func=request_postprocess_func,
             cfg_kv_collect_func=cfg_kv_collect_func,
         )
@@ -220,7 +220,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
         prompt_rewrite_func=prompt_rewrite_func,
-        tokenizer_rewrite_func=tokenizer_rewrite_func,
+        renderer_rewrite_func=renderer_rewrite_func,
         request_postprocess_func=request_postprocess_func,
         prompt_expand_func=prompt_expand_func,
     )

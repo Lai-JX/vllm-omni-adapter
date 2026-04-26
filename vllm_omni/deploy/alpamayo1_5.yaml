@@ -12,7 +12,7 @@ stage_args:
       devices: "0"
       requires_multimodal_data: true
 
-    tokenizer_rewrite_func: "vllm_omni.model_executor.stage_input_processors.alpamayo1_5.build_alpamayo_stage0_tokenizer"
+    renderer_rewrite_func: "vllm_omni.model_executor.stage_input_processors.alpamayo1_5.build_alpamayo_stage0_renderer"
     prompt_rewrite_func: "vllm_omni.model_executor.stage_input_processors.alpamayo1_5.rewrite_stage0_prompt_for_vllm_multimodal"
     request_postprocess_func: "vllm_omni.model_executor.stage_input_processors.alpamayo1_5.postprocess_stage0_request_for_traj_fusion"
 
@@ -42,7 +42,11 @@ stage_args:
         need_send_cache: true
         kv_transfer_criteria:
           type: special_token
-          token_id: 155681
+          # Trigger KV transfer on the forced extra stop token, not on
+          # <|traj_future_start|> itself, so the transferred cache has already
+          # advanced one step past the future-start boundary like the original
+          # HF StopAfterEOS behavior.
+          token_id: 151643
 
     output_connectors:
       to_stage_1: connector_of_shared_memory

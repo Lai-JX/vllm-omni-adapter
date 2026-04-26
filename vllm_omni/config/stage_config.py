@@ -67,7 +67,7 @@ class StageConfig:
     input_sources: list[int] = field(default_factory=list)
     custom_process_input_func: str | None = None
     prompt_rewrite_func: str | None = None
-    tokenizer_rewrite_func: str | None = None
+    renderer_rewrite_func: str | None = None
     request_postprocess_func: str | None = None
     final_output: bool = False
     final_output_type: str | None = None  # "text", "audio", "image"
@@ -147,8 +147,8 @@ class StageConfig:
             config_dict["custom_process_input_func"] = self.custom_process_input_func
         if self.prompt_rewrite_func:
             config_dict["prompt_rewrite_func"] = self.prompt_rewrite_func
-        if self.tokenizer_rewrite_func:
-            config_dict["tokenizer_rewrite_func"] = self.tokenizer_rewrite_func
+        if self.renderer_rewrite_func:
+            config_dict["renderer_rewrite_func"] = self.renderer_rewrite_func
         if self.request_postprocess_func:
             config_dict["request_postprocess_func"] = self.request_postprocess_func
 
@@ -408,7 +408,7 @@ class StageConfigFactory:
         "engine_input_source",
         "custom_process_input_func",
         "prompt_rewrite_func",
-        "tokenizer_rewrite_func",
+        "renderer_rewrite_func",
         "request_postprocess_func",
         "final_output",
         "final_output_type",
@@ -488,7 +488,7 @@ class StageConfigFactory:
                 input_sources=input_sources,
                 custom_process_input_func=stage_data.get("custom_process_input_func", None),
                 prompt_rewrite_func=stage_data.get("prompt_rewrite_func", None),
-                tokenizer_rewrite_func=stage_data.get("tokenizer_rewrite_func", None),
+                renderer_rewrite_func=stage_data.get("renderer_rewrite_func", None),
                 request_postprocess_func=stage_data.get("request_postprocess_func", None),
                 final_output=stage_data.get("final_output", False),
                 final_output_type=stage_data.get("final_output_type", None),
