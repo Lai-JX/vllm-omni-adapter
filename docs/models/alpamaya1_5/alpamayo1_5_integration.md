@@ -16,6 +16,8 @@
 
 基线 `f55ea28(v0.18.0)` 中没有 Alpamayo-1.5 的专用 pipeline。目标提交引入了一套新的两阶段拓扑，入口配置见 [alpamayo1_5.yaml](../../../vllm_omni/model_executor/stage_configs/alpamayo1_5.yaml)：
 
+![vLLM-Omni 两阶段架构图](./arch.png)
+
 1. stage 0 是 `llm` stage
    - `model_arch: Alpamayo1_5Qwen3VLForConditionalGeneration`
    - `worker_type: ar`
