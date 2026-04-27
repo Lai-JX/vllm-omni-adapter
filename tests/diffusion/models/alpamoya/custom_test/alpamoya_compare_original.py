@@ -29,7 +29,7 @@ from vllm_omni.model_executor.stage_input_processors.alpamayo1_5 import (
 from vllm_omni.model_executor.stage_input_processors import alpamayo1_5 as alp_stage_processors
 
 REQUEST_ID = "alpamayo-compare-original"
-FIXED_X0_SEED = 20260425
+FIXED_X0_SEED = 20260427
 FIXED_X0_SHAPE = (1, 64, 2)
 
 

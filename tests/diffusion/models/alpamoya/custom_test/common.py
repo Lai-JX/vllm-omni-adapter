@@ -26,7 +26,7 @@ from vllm_omni.model_executor.stage_input_processors.alpamayo1_5 import (
 )
 
 MODEL_PATH = "/share/models/Alpamayo-1.5-10B"
-YAML_PATH = str(REPO_ROOT / "vllm_omni" / "deploy" / "alpamayo1_5.yaml")
+YAML_PATH = str(REPO_ROOT / "vllm_omni" / "model_executor" / "stage_configs" / "alpamayo1_5.yaml")
 DATASET_PATH = "/share/datasets/ncore_10clips"
 CLIP_ID = "100ae358-f548-49b8-af4d-c0afdbcfe9ed"
 T0_US = 5_100_000
