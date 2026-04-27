@@ -14,7 +14,7 @@
 
 ## 2. 总体架构变化
 
-基线 `f55ea28(v0.18.0)` 中没有 Alpamayo-1.5 的专用 pipeline。目标提交引入了一套新的两阶段拓扑，入口配置见 [alpamayo1_5.yaml](vllm_omni/model_executor/stage_configs/alpamayo1_5.yaml)：
+基线 `f55ea28(v0.18.0)` 中没有 Alpamayo-1.5 的专用 pipeline。目标提交引入了一套新的两阶段拓扑，入口配置见 [alpamayo1_5.yaml](../../../vllm_omni/model_executor/stage_configs/alpamayo1_5.yaml)：
 
 1. stage 0 是 `llm` stage
    - `model_arch: Alpamayo1_5Qwen3VLForConditionalGeneration`
@@ -38,7 +38,7 @@
 
 ### 3.1 StageConfig 新增 hook 能力
 
-[stage_config.py](vllm_omni/config/stage_config.py) 为 stage 新增了几类重要扩展点：
+[stage_config.py](../../../vllm_omni/config/stage_config.py) 为 stage 新增了几类重要扩展点：
 
 - `prompt_rewrite_func`
 - `renderer_rewrite_func`
@@ -58,12 +58,12 @@
 
 新增或扩展了以下注册点：
 
-- [vllm_omni/model_executor/models/registry.py](vllm_omni/model_executor/models/registry.py)
-- [vllm_omni/model_executor/models/alpamayo1_5/__init__.py](vllm_omni/model_executor/models/alpamayo1_5/__init__.py)
-- [vllm_omni/model_executor/models/alpamayo1_5/alpamayo1_5_qwen3vl.py](vllm_omni/model_executor/models/alpamayo1_5/alpamayo1_5_qwen3vl.py)
-- [vllm_omni/diffusion/registry.py](vllm_omni/diffusion/registry.py)
-- [vllm_omni/diffusion/models/alpamayo1_5/__init__.py](vllm_omni/diffusion/models/alpamayo1_5/__init__.py)
-- [vllm_omni/transformers_utils/configs/alpamayo1_5.py](vllm_omni/transformers_utils/configs/alpamayo1_5.py)
+- [vllm_omni/model_executor/models/registry.py](../../../vllm_omni/model_executor/models/registry.py)
+- [vllm_omni/model_executor/models/alpamayo1_5/__init__.py](../../../vllm_omni/model_executor/models/alpamayo1_5/__init__.py)
+- [vllm_omni/model_executor/models/alpamayo1_5/alpamayo1_5_qwen3vl.py](../../../vllm_omni/model_executor/models/alpamayo1_5/alpamayo1_5_qwen3vl.py)
+- [vllm_omni/diffusion/registry.py](../../../vllm_omni/diffusion/registry.py)
+- [vllm_omni/diffusion/models/alpamayo1_5/__init__.py](../../../vllm_omni/diffusion/models/alpamayo1_5/__init__.py)
+- [vllm_omni/transformers_utils/configs/alpamayo1_5.py](../../../vllm_omni/transformers_utils/configs/alpamayo1_5.py)
 
 对应结果是：
 
@@ -76,7 +76,7 @@
 
 ## 4.1 自定义 VLM 模型包装与本地 runtime 工具
 
-[alpamayo1_5_qwen3vl.py](vllm_omni/model_executor/models/alpamayo1_5/alpamayo1_5_qwen3vl.py) 做了两件关键事：
+[alpamayo1_5_qwen3vl.py](../../../vllm_omni/model_executor/models/alpamayo1_5/alpamayo1_5_qwen3vl.py) 做了两件关键事：
 
 1. 复原 stage 0 应该使用的 Qwen3-VL HF config
    - 从 Alpamayo `config.json` 中读取 `vlm_name_or_path`
@@ -89,17 +89,17 @@
 
 这保证了一个混合 checkpoint 可以被拆开，分别供两个 stage 使用。
 
-同时，[runtime.py](vllm_omni/model_executor/models/alpamayo1_5/runtime.py) 把 stage 0 侧的运行时基础能力单独沉淀出来，包括：
+同时，[runtime.py](../../../vllm_omni/model_executor/models/alpamayo1_5/runtime.py) 把 stage 0 侧的运行时基础能力单独沉淀出来，包括：
 
 - `TRAJ_TOKEN` / `SPECIAL_TOKENS`
 - 本地 history trajectory tokenizer 实现
 - `tokenize_history_trajectory()`
 
-这样 [alpamayo1_5.py](vllm_omni/model_executor/stage_input_processors/alpamayo1_5.py) 只负责输入改写与 stage 间数据转换，不再同时承载大量底层 token/runtime 定义。
+这样 [alpamayo1_5.py](../../../vllm_omni/model_executor/stage_input_processors/alpamayo1_5.py) 只负责输入改写与 stage 间数据转换，不再同时承载大量底层 token/runtime 定义。
 
 ## 4.2 Stage 0 输入链路
 
-Alpamayo 的 stage 0 输入适配集中在 [alpamayo1_5.py](vllm_omni/model_executor/stage_input_processors/alpamayo1_5.py)。
+Alpamayo 的 stage 0 输入适配集中在 [alpamayo1_5.py](../../../vllm_omni/model_executor/stage_input_processors/alpamayo1_5.py)。
 
 ### a. `prompt_rewrite_func`
 
@@ -132,7 +132,7 @@ Alpamayo 的 stage 0 输入适配集中在 [alpamayo1_5.py](vllm_omni/model_exec
 
 ## 4.3 Stage 0 停止语义与 KV 边界
 
-[alpamayo1_5_stop_after_future_start.py](vllm_omni/model_executor/stage_input_processors/alpamayo1_5_stop_after_future_start.py) 新增了 `AlpamayoStopAfterFutureStartLogitsProcessor`。
+[alpamayo1_5_stop_after_future_start.py](../../../vllm_omni/model_executor/stage_input_processors/alpamayo1_5_stop_after_future_start.py) 新增了 `AlpamayoStopAfterFutureStartLogitsProcessor`。
 
 它的作用不是简单停止，而是复现原始 Alpamayo 的语义：
 
@@ -155,7 +155,7 @@ YAML 里同时配了：
 
 ## 5.1 Model runner 侧新增信息
 
-[gpu_model_runner.py](vllm_omni/worker/gpu_model_runner.py) 和 [gpu_ar_model_runner.py](vllm_omni/worker/gpu_ar_model_runner.py) 让 stage 0 除了 token 之外，还能携带 Alpamayo 后续要用的信息。
+[gpu_model_runner.py](../../../vllm_omni/worker/gpu_model_runner.py) 和 [gpu_ar_model_runner.py](../../../vllm_omni/worker/gpu_ar_model_runner.py) 让 stage 0 除了 token 之外，还能携带 Alpamayo 后续要用的信息。
 
 主要包括：
 
@@ -169,7 +169,7 @@ YAML 里同时配了：
 
 ## 5.2 OutputProcessor 的多模态累计
 
-[output_processor.py](vllm_omni/engine/output_processor.py) 新增 `OmniRequestState`，它在原有 text output 之外还能累计多模态张量。
+[output_processor.py](../../../vllm_omni/engine/output_processor.py) 新增 `OmniRequestState`，它在原有 text output 之外还能累计多模态张量。
 
 核心行为：
 
@@ -186,7 +186,7 @@ YAML 里同时配了：
 
 ## 6. Stage 0 -> Stage 1 数据改写
 
-这个阶段的核心函数是 [alpamayo1_5.py](vllm_omni/model_executor/stage_input_processors/alpamayo1_5.py) 里的 `vlm2trajectory()`。
+这个阶段的核心函数是 [alpamayo1_5.py](../../../vllm_omni/model_executor/stage_input_processors/alpamayo1_5.py) 里的 `vlm2trajectory()`。
 
 它读取 stage 0 `RequestOutput`，再和原始请求的 `additional_information` 合并，构造 stage 1 所需上下文。主要写入：
 
@@ -232,7 +232,7 @@ YAML 里同时配了：
 
 ## 7.1 新增 diffusion pipeline 与 stage 1 runtime 拆分
 
-[pipeline_alpamayo1_5.py](vllm_omni/diffusion/models/alpamayo1_5/pipeline_alpamayo1_5.py) 是这次适配的主体。
+[pipeline_alpamayo1_5.py](../../../vllm_omni/diffusion/models/alpamayo1_5/pipeline_alpamayo1_5.py) 是这次适配的主体。
 
 它承担的职责包括：
 
@@ -247,7 +247,7 @@ YAML 里同时配了：
 - 构造 rollout 所需位置编码与 attention mask
 - 输出最终 `pred_xyz` / `pred_rot` / `cot_token_ids`
 
-不过当前范围内，stage 1 不再把所有基础模块都塞在一个文件里。[runtime.py](vllm_omni/diffusion/models/alpamayo1_5/runtime.py) 已经把下列运行时组件拆出去：
+不过当前范围内，stage 1 不再把所有基础模块都塞在一个文件里。[runtime.py](../../../vllm_omni/diffusion/models/alpamayo1_5/runtime.py) 已经把下列运行时组件拆出去：
 
 - `ActionSpace` 抽象与 `UnicycleAccelCurvatureActionSpace`
 - `FlowMatching`
@@ -288,7 +288,7 @@ KV cache 不是通过 `additional_information` 传的，而是走 `sampling_para
 
 1. stage 0 在 special token 条件满足时发送 KV
 2. diffusion stage 根据 `omni_kv_config.need_recv_cache: true` 接收 KV
-3. [diffusion_model_runner.py](vllm_omni/diffusion/worker/diffusion_model_runner.py) 在执行请求前完成 KV 接收
+3. [diffusion_model_runner.py](../../../vllm_omni/diffusion/worker/diffusion_model_runner.py) 在执行请求前完成 KV 接收
 4. `pipeline_alpamayo1_5.py` 把收到的 KV 重建成 `DynamicCache`
 
 因此，stage 1 的 rollout 依赖的是两份数据：
@@ -300,7 +300,7 @@ KV cache 不是通过 `additional_information` 传的，而是走 `sampling_para
 
 ## 8.1 AsyncOmniEngine 接入新 hook
 
-[async_omni_engine.py](vllm_omni/engine/async_omni_engine.py) 的主要适配点：
+[async_omni_engine.py](../../../vllm_omni/engine/async_omni_engine.py) 的主要适配点：
 
 - 通过 `extract_stage_metadata()` 读取 stage hook
 - stage 0 attach 时，优先用 `renderer_rewrite_func` 创建 custom renderer
@@ -331,9 +331,9 @@ KV cache 不是通过 `additional_information` 传的，而是走 `sampling_para
 
 ### 9.1 调试 dump 工具
 
-- [request_state_dump.py](vllm_omni/debug/request_state_dump.py)
-- [compare_request_state_dump.py](vllm_omni/debug/compare_request_state_dump.py)
-- [alpamayo_stage1_rollout_dump.py](vllm_omni/debug/alpamayo_stage1_rollout_dump.py)
+- [request_state_dump.py](../../../vllm_omni/debug/request_state_dump.py)
+- [compare_request_state_dump.py](../../../vllm_omni/debug/compare_request_state_dump.py)
+- [alpamayo_stage1_rollout_dump.py](../../../vllm_omni/debug/alpamayo_stage1_rollout_dump.py)
 
 它们用于在关键 phase 导出：
 
@@ -419,46 +419,46 @@ KV cache 不是通过 `additional_information` 传的，而是走 `sampling_para
 
 ### 配置与注册
 
-- [vllm_omni/config/stage_config.py](vllm_omni/config/stage_config.py)
-- [vllm_omni/model_executor/stage_configs/alpamayo1_5.yaml](vllm_omni/model_executor/stage_configs/alpamayo1_5.yaml)
-- [vllm_omni/transformers_utils/configs/alpamayo1_5.py](vllm_omni/transformers_utils/configs/alpamayo1_5.py)
-- [vllm_omni/model_executor/models/registry.py](vllm_omni/model_executor/models/registry.py)
-- [vllm_omni/diffusion/registry.py](vllm_omni/diffusion/registry.py)
+- [vllm_omni/config/stage_config.py](../../../vllm_omni/config/stage_config.py)
+- [vllm_omni/model_executor/stage_configs/alpamayo1_5.yaml](../../../vllm_omni/model_executor/stage_configs/alpamayo1_5.yaml)
+- [vllm_omni/transformers_utils/configs/alpamayo1_5.py](../../../vllm_omni/transformers_utils/configs/alpamayo1_5.py)
+- [vllm_omni/model_executor/models/registry.py](../../../vllm_omni/model_executor/models/registry.py)
+- [vllm_omni/diffusion/registry.py](../../../vllm_omni/diffusion/registry.py)
 
 ### stage 0 适配
 
-- [vllm_omni/model_executor/models/alpamayo1_5/alpamayo1_5_qwen3vl.py](vllm_omni/model_executor/models/alpamayo1_5/alpamayo1_5_qwen3vl.py)
-- [vllm_omni/model_executor/models/alpamayo1_5/runtime.py](vllm_omni/model_executor/models/alpamayo1_5/runtime.py)
-- [vllm_omni/model_executor/stage_input_processors/alpamayo1_5.py](vllm_omni/model_executor/stage_input_processors/alpamayo1_5.py)
-- [vllm_omni/model_executor/stage_input_processors/alpamayo1_5_stop_after_future_start.py](vllm_omni/model_executor/stage_input_processors/alpamayo1_5_stop_after_future_start.py)
-- [vllm_omni/worker/gpu_model_runner.py](vllm_omni/worker/gpu_model_runner.py)
-- [vllm_omni/worker/gpu_ar_model_runner.py](vllm_omni/worker/gpu_ar_model_runner.py)
-- [vllm_omni/engine/output_processor.py](vllm_omni/engine/output_processor.py)
+- [vllm_omni/model_executor/models/alpamayo1_5/alpamayo1_5_qwen3vl.py](../../../vllm_omni/model_executor/models/alpamayo1_5/alpamayo1_5_qwen3vl.py)
+- [vllm_omni/model_executor/models/alpamayo1_5/runtime.py](../../../vllm_omni/model_executor/models/alpamayo1_5/runtime.py)
+- [vllm_omni/model_executor/stage_input_processors/alpamayo1_5.py](../../../vllm_omni/model_executor/stage_input_processors/alpamayo1_5.py)
+- [vllm_omni/model_executor/stage_input_processors/alpamayo1_5_stop_after_future_start.py](../../../vllm_omni/model_executor/stage_input_processors/alpamayo1_5_stop_after_future_start.py)
+- [vllm_omni/worker/gpu_model_runner.py](../../../vllm_omni/worker/gpu_model_runner.py)
+- [vllm_omni/worker/gpu_ar_model_runner.py](../../../vllm_omni/worker/gpu_ar_model_runner.py)
+- [vllm_omni/engine/output_processor.py](../../../vllm_omni/engine/output_processor.py)
 
 ### stage 1 适配
 
-- [vllm_omni/diffusion/models/alpamayo1_5/pipeline_alpamayo1_5.py](vllm_omni/diffusion/models/alpamayo1_5/pipeline_alpamayo1_5.py)
-- [vllm_omni/diffusion/models/alpamayo1_5/runtime.py](vllm_omni/diffusion/models/alpamayo1_5/runtime.py)
-- [vllm_omni/diffusion/worker/diffusion_model_runner.py](vllm_omni/diffusion/worker/diffusion_model_runner.py)
+- [vllm_omni/diffusion/models/alpamayo1_5/pipeline_alpamayo1_5.py](../../../vllm_omni/diffusion/models/alpamayo1_5/pipeline_alpamayo1_5.py)
+- [vllm_omni/diffusion/models/alpamayo1_5/runtime.py](../../../vllm_omni/diffusion/models/alpamayo1_5/runtime.py)
+- [vllm_omni/diffusion/worker/diffusion_model_runner.py](../../../vllm_omni/diffusion/worker/diffusion_model_runner.py)
 
 ### 引擎与初始化
 
-- [vllm_omni/engine/async_omni_engine.py](vllm_omni/engine/async_omni_engine.py)
-- [vllm_omni/engine/stage_init_utils.py](vllm_omni/engine/stage_init_utils.py)
-- [vllm_omni/engine/orchestrator.py](vllm_omni/engine/orchestrator.py)
-- [vllm_omni/entrypoints/async_omni_diffusion.py](vllm_omni/entrypoints/async_omni_diffusion.py)
+- [vllm_omni/engine/async_omni_engine.py](../../../vllm_omni/engine/async_omni_engine.py)
+- [vllm_omni/engine/stage_init_utils.py](../../../vllm_omni/engine/stage_init_utils.py)
+- [vllm_omni/engine/orchestrator.py](../../../vllm_omni/engine/orchestrator.py)
+- [vllm_omni/entrypoints/async_omni_diffusion.py](../../../vllm_omni/entrypoints/async_omni_diffusion.py)
 
 ### 调试与验证
 
-- [vllm_omni/debug/request_state_dump.py](vllm_omni/debug/request_state_dump.py)
-- [vllm_omni/debug/compare_request_state_dump.py](vllm_omni/debug/compare_request_state_dump.py)
-- [vllm_omni/debug/alpamayo_stage1_rollout_dump.py](vllm_omni/debug/alpamayo_stage1_rollout_dump.py)
-- [tests/diffusion/models/alpamoya/custom_test/alpamoya_2stage_test.py](/workspace/project/RL-learning/vllm-omni/tests/diffusion/models/alpamoya/custom_test/alpamoya_2stage_test.py)
-- [tests/diffusion/models/alpamoya/custom_test/alpamoya_compare_original.py](/workspace/project/RL-learning/vllm-omni/tests/diffusion/models/alpamoya/custom_test/alpamoya_compare_original.py)
-- [tests/diffusion/models/alpamoya/custom_test/alpamoya_fixed_x0_compare.py](/workspace/project/RL-learning/vllm-omni/tests/diffusion/models/alpamoya/custom_test/alpamoya_fixed_x0_compare.py)
-- [tests/diffusion/models/alpamoya/custom_test/alpamoya_repro_check.py](/workspace/project/RL-learning/vllm-omni/tests/diffusion/models/alpamoya/custom_test/alpamoya_repro_check.py)
-- [tests/diffusion/models/alpamoya/custom_test/alpamoya_single_batch_test.py](/workspace/project/RL-learning/vllm-omni/tests/diffusion/models/alpamoya/custom_test/alpamoya_single_batch_test.py)
-- [tests/diffusion/models/alpamoya/custom_test/common.py](/workspace/project/RL-learning/vllm-omni/tests/diffusion/models/alpamoya/custom_test/common.py)
+- [vllm_omni/debug/request_state_dump.py](../../../vllm_omni/debug/request_state_dump.py)
+- [vllm_omni/debug/compare_request_state_dump.py](../../../vllm_omni/debug/compare_request_state_dump.py)
+- [vllm_omni/debug/alpamayo_stage1_rollout_dump.py](../../../vllm_omni/debug/alpamayo_stage1_rollout_dump.py)
+- [tests/diffusion/models/alpamoya/custom_test/alpamoya_2stage_test.py](../../../tests/diffusion/models/alpamoya/custom_test/alpamoya_2stage_test.py)
+- [tests/diffusion/models/alpamoya/custom_test/alpamoya_compare_original.py](../../../tests/diffusion/models/alpamoya/custom_test/alpamoya_compare_original.py)
+- [tests/diffusion/models/alpamoya/custom_test/alpamoya_fixed_x0_compare.py](../../../tests/diffusion/models/alpamoya/custom_test/alpamoya_fixed_x0_compare.py)
+- [tests/diffusion/models/alpamoya/custom_test/alpamoya_repro_check.py](../../../tests/diffusion/models/alpamoya/custom_test/alpamoya_repro_check.py)
+- [tests/diffusion/models/alpamoya/custom_test/alpamoya_single_batch_test.py](../../../tests/diffusion/models/alpamoya/custom_test/alpamoya_single_batch_test.py)
+- [tests/diffusion/models/alpamoya/custom_test/common.py](../../../tests/diffusion/models/alpamoya/custom_test/common.py)
 
 ## 12. 总结
 

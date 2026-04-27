@@ -12,10 +12,10 @@
 
 ## 1. 目录导航
 
-- 总体设计说明：[alpamayo1_5_integration.md](vllm-omni/docs/models/alpamaya1_5/alpamayo1_5_integration.md)
-- 改动文件清单：[alpamayo1_5_change_inventory.md](vllm-omni/docs/models/alpamaya1_5/alpamayo1_5_change_inventory.md)
-- 两阶段配置文件：[alpamayo1_5.yaml](vllm-omni/vllm_omni/model_executor/stage_configs/alpamayo1_5.yaml)
-- 测试目录：[custom_test](vllm-omni/tests/diffusion/models/alpamoya/custom_test)
+- 总体设计说明：[alpamayo1_5_integration.md](./alpamayo1_5_integration.md)
+- 改动文件清单：[alpamayo1_5_change_inventory.md](./alpamayo1_5_change_inventory.md)
+- 两阶段配置文件：[alpamayo1_5.yaml](../../../vllm_omni/model_executor/stage_configs/alpamayo1_5.yaml)
+- 测试目录：[custom_test](../../../tests/diffusion/models/alpamoya/custom_test)
 
 ## 2. 你需要先准备什么
 
@@ -25,7 +25,7 @@
 - 数据集目录：`/share/datasets/ncore_10clips`
 - 原始 Alpamayo 源码目录：`../alpamayo1.5/src`
 
-对应代码位置见 [common.py](vllm-omni/tests/diffusion/models/alpamoya/custom_test/common.py:22)。
+对应代码位置见 [common.py](../../../tests/diffusion/models/alpamoya/custom_test/common.py#L22)。
 
 这里需要特别区分两类依赖：
 
@@ -35,7 +35,7 @@
 - `ALPAMAYO_SRC`
   - 不是所有测试脚本、也不是所有部署场景的硬性前提
   - 只有当脚本直接或间接依赖原始 `alpamayo1_5` Python 包时才需要
-  - 当前最典型的依赖入口是 [common.py](vllm-omni/tests/diffusion/models/alpamoya/custom_test/common.py) 和 [alpamoya_compare_original.py](vllm-omni/tests/diffusion/models/alpamoya/custom_test/alpamoya_compare_original.py)
+  - 当前最典型的依赖入口是 [common.py](../../../tests/diffusion/models/alpamoya/custom_test/common.py) 和 [alpamoya_compare_original.py](../../../tests/diffusion/models/alpamoya/custom_test/alpamoya_compare_original.py)
 
 换句话说，`ALPAMAYO_SRC` 更像是“测试辅助 / 原始实现对照”依赖，而不是这套两阶段接入逻辑本身的统一前置条件。
 
@@ -62,7 +62,7 @@
    - 主输入通过 `custom_process_input_func` 转换
    - KV cache 通过 connector 传递
 
-配置入口在 [alpamayo1_5.yaml](vllm-omni/vllm_omni/model_executor/stage_configs/alpamayo1_5.yaml:1)。
+配置入口在 [alpamayo1_5.yaml](../../../vllm_omni/model_executor/stage_configs/alpamayo1_5.yaml#L1)。
 
 ## 4. 5 分钟跑通
 
@@ -116,47 +116,9 @@ python tests/diffusion/models/alpamoya/custom_test/alpamoya_2stage_test.py
 6. `alpamoya_fixed_x0_compare.py`
    - 固定 `initial_noise_x0` 后做更严格对比
 
-这些脚本都在 [tests/diffusion/models/alpamoya/custom_test](vllm-omni/tests/diffusion/models/alpamoya/custom_test)。
+这些脚本都在 [tests/diffusion/models/alpamoya/custom_test](../../../tests/diffusion/models/alpamoya/custom_test)。
 
-## 6. 最关键的几个文件
-
-如果你需要开始改代码，优先读这几个：
-
-- [alpamayo1_5.yaml](vllm-omni/vllm_omni/model_executor/stage_configs/alpamayo1_5.yaml)
-  - 看 stage 拓扑、hook、KV connector、默认 sampling 配置
-
-- [alpamayo1_5.py](vllm-omni/vllm_omni/model_executor/stage_input_processors/alpamayo1_5.py)
-  - 看 stage 0 prompt 改写、renderer 构造、history trajectory token 融合、`vlm2trajectory()`
-
-- [alpamayo1_5_qwen3vl.py](vllm-omni/vllm_omni/model_executor/models/alpamayo1_5/alpamayo1_5_qwen3vl.py)
-  - 看 stage 0 checkpoint 如何拆出 `vlm.` 权重
-
-- [pipeline_alpamayo1_5.py](vllm-omni/vllm_omni/diffusion/models/alpamayo1_5/pipeline_alpamayo1_5.py)
-  - 看 stage 1 rollout context 如何构造
-
-- [common.py](vllm-omni/tests/diffusion/models/alpamoya/custom_test/common.py)
-  - 看 prompt、数据、临时 YAML、sampling params 是怎么组织的
-
-## 7. 常见改动入口
-
-不同目标，通常从不同文件入手：
-
-- 想改 prompt 或多模态输入处理
-  - 先看 [alpamayo1_5.py](vllm-omni/vllm_omni/model_executor/stage_input_processors/alpamayo1_5.py)
-
-- 想改 stage 0 停止边界或 KV 发送时机
-  - 先看 [alpamayo1_5_stop_after_future_start.py](vllm-omni/vllm_omni/model_executor/stage_input_processors/alpamayo1_5_stop_after_future_start.py)
-  - 再看 [alpamayo1_5.yaml](vllm-omni/vllm_omni/model_executor/stage_configs/alpamayo1_5.yaml)
-
-- 想改 stage 1 rollout 或轨迹输出
-  - 先看 [pipeline_alpamayo1_5.py](vllm-omni/vllm_omni/diffusion/models/alpamayo1_5/pipeline_alpamayo1_5.py)
-  - 再看 [runtime.py](vllm-omni/vllm_omni/diffusion/models/alpamayo1_5/runtime.py)
-
-- 想改 runner 层中间态透传
-  - GPU 路径优先看 [gpu_model_runner.py](vllm-omni/vllm_omni/worker/gpu_model_runner.py) 和 [gpu_ar_model_runner.py](vllm-omni/vllm_omni/worker/gpu_ar_model_runner.py)
-  - NPU 路径优先看 [npu_model_runner.py](vllm-omni/vllm_omni/platforms/npu/worker/npu_model_runner.py) 和 [npu_ar_model_runner.py](vllm-omni/vllm_omni/platforms/npu/worker/npu_ar_model_runner.py)
-
-## 8. 出问题先看什么
+## 6. 出问题先看什么
 
 常见问题可以先按这张表排：
 
@@ -165,7 +127,7 @@ python tests/diffusion/models/alpamoya/custom_test/alpamoya_2stage_test.py
   - 再跑 `alpamoya_test.py`
 
 - stage 0 能跑，stage 1 没输出
-  - 先看 [alpamayo1_5.yaml](vllm-omni/vllm_omni/model_executor/stage_configs/alpamayo1_5.yaml) 里的 `engine_input_source`、`custom_process_input_func`、`omni_kv_config`
+  - 先看 [alpamayo1_5.yaml](../../../vllm_omni/model_executor/stage_configs/alpamayo1_5.yaml) 里的 `engine_input_source`、`custom_process_input_func`、`omni_kv_config`
   - 再检查 `stage0_context_used`
 
 - stage 1 输出 shape 不对或 KV 上下文异常
@@ -176,21 +138,21 @@ python tests/diffusion/models/alpamoya/custom_test/alpamoya_2stage_test.py
   - 跑 `alpamoya_compare_original.py`
   - 必要时启用 request dump / rollout dump
 
-## 9. 调试开关
+## 7. 调试开关
 
 当前仓库已经内置两类 dump 工具：
 
 - request state dump
-  - 代码：[request_state_dump.py](vllm-omni/vllm_omni/debug/request_state_dump.py)
+  - 代码：[request_state_dump.py](../../../vllm_omni/debug/request_state_dump.py)
 
 - stage 1 rollout dump
-  - 代码：[alpamayo_stage1_rollout_dump.py](vllm-omni/vllm_omni/debug/alpamayo_stage1_rollout_dump.py)
+  - 代码：[alpamayo_stage1_rollout_dump.py](../../../vllm_omni/debug/alpamayo_stage1_rollout_dump.py)
 
 如果你要对齐原始实现，推荐直接配合：
 
-- [alpamoya_compare_original.py](vllm-omni/tests/diffusion/models/alpamoya/custom_test/alpamoya_compare_original.py)
-- [alpamoya_fixed_x0_compare.py](vllm-omni/tests/diffusion/models/alpamoya/custom_test/alpamoya_fixed_x0_compare.py)
+- [alpamoya_compare_original.py](../../../tests/diffusion/models/alpamoya/custom_test/alpamoya_compare_original.py)
+- [alpamoya_fixed_x0_compare.py](../../../tests/diffusion/models/alpamoya/custom_test/alpamoya_fixed_x0_compare.py)
 
-## 10. 一句话建议
+## 8. 一句话建议
 
-第一次上手时，不要先读完整改动清单，也不要一开始就跑最重的 compare 脚本。先用 `alpamoya_test.py` 和 `alpamoya_2stage_test.py` 确认链路通，再按问题去读 [alpamayo1_5_integration.md](vllm-omni/docs/models/alpamaya1_5/alpamayo1_5_integration.md) 和 [alpamayo1_5_change_inventory.md](vllm-omni/docs/models/alpamaya1_5/alpamayo1_5_change_inventory.md)，效率会高很多。
+第一次上手时，不要先读完整改动清单，也不要一开始就跑最重的 compare 脚本。先用 `alpamoya_test.py` 和 `alpamoya_2stage_test.py` 确认链路通，再按问题去读 [alpamayo1_5_integration.md](./alpamayo1_5_integration.md) 和 [alpamayo1_5_change_inventory.md](./alpamayo1_5_change_inventory.md)，效率会高很多。
