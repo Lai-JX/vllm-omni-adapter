@@ -19,7 +19,6 @@
 1. stage 0 是 `llm` stage
    - `model_arch: Alpamayo1_5Qwen3VLForConditionalGeneration`
    - `worker_type: ar`
-   - 输出类型是 `latent`
    - 负责多模态输入展开、文本 token 生成、latent 与若干辅助张量产出
 
 2. stage 1 是 `diffusion` stage
@@ -48,7 +47,7 @@
 它们分别对应：
 
 - 进入 `InputProcessor` 之前改 prompt
-- 在构造 `InputProcessor` 前替换 renderer
+- 在构造 `InputProcessor` 前替换 renderer(tokenizer)
 - `InputProcessor.process_inputs()` 之后再改 request
 - 上一 stage 完成后，把输出重写成下一 stage 的输入
 
@@ -203,6 +202,8 @@ YAML 里同时配了：
 - `stage0_rope_deltas`
 - `stage0_attention_mask`
 - `stage0_prefill_seq_len` / `stage0_prefill_seq_lens`
+
+> 注：这些数据存在冗余，目前为了稳定，还未进行优化
 
 这里尤其要注意三类信息：
 

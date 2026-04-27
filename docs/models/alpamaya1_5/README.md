@@ -156,3 +156,9 @@ python tests/diffusion/models/alpamoya/custom_test/alpamoya_2stage_test.py
 ## 8. 一句话建议
 
 第一次上手时，不要先读完整改动清单，也不要一开始就跑最重的 compare 脚本。先用 `alpamoya_test.py` 和 `alpamoya_2stage_test.py` 确认链路通，再按问题去读 [alpamayo1_5_integration.md](./alpamayo1_5_integration.md) 和 [alpamayo1_5_change_inventory.md](./alpamayo1_5_change_inventory.md)，效率会高很多。
+
+## 9. 后续优化
++ 完善对batch请求的支持
++ 减少传输过程中的数据冗余
++ 完善在线支持
++ 完善对npu的支持（[npu_model_runner.py](../../../vllm_omni/platforms/npu/worker/npu_model_runner.py) 和 [npu_ar_model_runner.py](../../../vllm_omni/platforms/npu/worker/npu_ar_model_runner.py)）
