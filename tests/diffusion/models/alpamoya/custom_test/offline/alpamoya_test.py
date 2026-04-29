@@ -2,7 +2,7 @@ import asyncio
 from pathlib import Path
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from common import (
+from tests.diffusion.models.alpamoya.custom_test.offline.common import (
     MODEL_PATH,
     build_prompt_from_messages,
     build_stage0_only_sampling_params,

@@ -16,7 +16,7 @@ from alpamayo1_5 import helper
 from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
 from alpamayo1_5.models.alpamayo1_5 import ExpertLogitsProcessor
 from alpamayo1_5.models.token_utils import StopAfterEOS, replace_padding_after_eos, to_special_token
-import common as ct
+import tests.diffusion.models.alpamoya.custom_test.offline.common as ct
 from vllm_omni.debug.compare_request_state_dump import compare_dump_files
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion

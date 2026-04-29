@@ -47,6 +47,13 @@ stage_args:
           # advanced one step past the future-start boundary like the original
           # HF StopAfterEOS behavior.
           token_id: 151643
+      profiler_config:
+        profiler: torch
+        torch_profiler_dir: /workspace/project/RL-learning/vllm-omni/learning/test/torch_traces
+        torch_profiler_record_shapes: true
+        torch_profiler_with_memory: true
+        torch_profiler_with_stack: true
+        torch_profiler_use_gzip: false
 
     output_connectors:
       to_stage_1: connector_of_shared_memory
@@ -86,6 +93,13 @@ stage_args:
       omni_kv_config:
         need_recv_cache: true
         recv_timeout: 3.0
+      profiler_config:
+        profiler: torch
+        torch_profiler_dir: /workspace/project/RL-learning/vllm-omni/learning/test/torch_traces
+        torch_profiler_record_shapes: true
+        torch_profiler_with_memory: true
+        torch_profiler_with_stack: true
+        torch_profiler_use_gzip: false
 
     custom_process_input_func: "vllm_omni.model_executor.stage_input_processors.alpamayo1_5.vlm2trajectory"
 

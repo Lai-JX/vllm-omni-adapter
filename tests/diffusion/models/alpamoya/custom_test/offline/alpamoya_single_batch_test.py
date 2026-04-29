@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from vllm_omni.entrypoints.omni import Omni
-from common import (
+from tests.diffusion.models.alpamoya.custom_test.offline.common import (
     CLIP_ID,
     MODEL_PATH,
     T0_US,
@@ -15,6 +15,9 @@ from common import (
     build_stage_params,
     build_two_stage_yaml,
     load_shared_data,
+)
+from tests.diffusion.models.alpamoya.custom_test.offline.alpamoya_compare_original import (
+    build_fixed_initial_noise_x0,
 )
 CLIP_ID_LIST = [
     "100ae358-f548-49b8-af4d-c0afdbcfe9ed",
@@ -74,6 +77,14 @@ def _extract_first_token_ids(cot_ids_np: np.ndarray) -> list[int]:
     return token_ids.tolist()
 
 
+def _request_index(request_id: str) -> int:
+    request_index, _, _ = request_id.partition("_")
+    try:
+        return int(request_index)
+    except ValueError as exc:
+        raise ValueError(f"unexpected request_id format: {request_id}") from exc
+
+
 def main() -> None:
     args = _build_argparser().parse_args()
     tokenizer = build_alpamayo_stage0_tokenizer(MODEL_PATH)
@@ -93,6 +104,7 @@ def main() -> None:
             data=data,
             frames=frames,
             tokenizer=tokenizer,
+            initial_noise_x0=build_fixed_initial_noise_x0()
         )
         batch_items.append(
             {
@@ -125,12 +137,22 @@ def main() -> None:
             raise RuntimeError(
                 f"expected {batch_size} final outputs, got {len(final_outputs)}"
             )
+        outputs_by_index = {
+            _request_index(final_output.request_id): final_output for final_output in final_outputs
+        }
+        if len(outputs_by_index) != batch_size:
+            raise RuntimeError(
+                f"expected {batch_size} unique request ids, got {len(outputs_by_index)}"
+            )
 
         print("batch_size:", batch_size)
         print("clip_ids:", clip_ids)
         print("t0_us_values:", t0_values)
 
-        for batch_index, (item, final_output) in enumerate(zip(batch_items, final_outputs, strict=True)):
+        for batch_index, item in enumerate(batch_items):
+            final_output = outputs_by_index.get(batch_index)
+            if final_output is None:
+                raise RuntimeError(f"missing final output for request index {batch_index}")
             custom = final_output.custom_output
             pred_xyz = custom["pred_xyz"]
             pred_rot = custom["pred_rot"]

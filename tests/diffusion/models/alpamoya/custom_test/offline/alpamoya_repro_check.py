@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from vllm_omni.entrypoints.async_omni import AsyncOmni
-from common import (
+from tests.diffusion.models.alpamoya.custom_test.offline.common import (
     MODEL_PATH,
     build_alpamayo_stage0_tokenizer,
     build_prompt_from_messages,

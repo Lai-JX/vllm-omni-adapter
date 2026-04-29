@@ -539,11 +539,19 @@ class AsyncOmni(EngineClient, OmniBase):
         """List all loaded LoRA adapter IDs across stages."""
         results = await self.collective_rpc(method="list_loras")
         merged: set[int] = set()
+
+        def _collect_ids(value: Any) -> None:
+            if isinstance(value, int):
+                merged.add(value)
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    _collect_ids(item)
+
         for result in results:
             if isinstance(result, dict) and result.get("todo"):
                 continue
-            if isinstance(result, list):
-                merged.update(result)
+            _collect_ids(result)
         return sorted(merged)
 
     async def pin_lora(self, adapter_id: int) -> bool:

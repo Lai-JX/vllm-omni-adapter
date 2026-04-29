@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from alpamoya_compare_original import (
+from tests.diffusion.models.alpamoya.custom_test.offline.alpamoya_compare_original import (
     REQUEST_ID,
     build_fixed_initial_noise_x0,
     compare_tensors,

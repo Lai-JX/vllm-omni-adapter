@@ -559,8 +559,8 @@ def vlm2trajectory(
     prompts = prompt if isinstance(prompt, list) else [prompt] * len(stage_outputs)
 
     trajectory_inputs: list[OmniTextPrompt] = []
-    for i, stage_output in enumerate(stage_outputs): 
-        outputs = list(stage_output.outputs or [])  # CompletionOutput
+    for i, stage_output in enumerate(stage_outputs):    # RequestOutput
+        outputs = list(stage_output.outputs or [])      # CompletionOutput
         if not outputs:
             raise RuntimeError("Stage 0 produced no completion outputs for Alpamayo trajectory rollout")
         original_prompt = _normalize_prompt(prompts[i] if i < len(prompts) else None)
@@ -601,13 +601,13 @@ def vlm2trajectory(
             transformed_info["stage0_latent"] = latent.detach().cpu().to(torch.float32).contiguous()
             transformed_info["stage0_latent_shape"] = list(latent.shape)
         prompt_mrope_position_delta = multimodal_output.get("prompt_mrope_position_delta")
-        initial_noise_x0 = multimodal_output.get("initial_noise_x0")
-        if isinstance(initial_noise_x0, torch.Tensor):
-            transformed_info["initial_noise_x0"] = initial_noise_x0.detach().cpu().contiguous()
-        for key in ("rope_deltas", "attention_mask"):
-            value = multimodal_output.get(key)
-            if isinstance(value, torch.Tensor):
-                transformed_info[f"stage0_{key}"] = value.detach().cpu().contiguous()
+        # initial_noise_x0 = multimodal_output.get("initial_noise_x0")
+        # if isinstance(initial_noise_x0, torch.Tensor):
+        #     transformed_info["initial_noise_x0"] = initial_noise_x0.detach().cpu().contiguous()
+        # for key in ("rope_deltas", "attention_mask"):
+        #     value = multimodal_output.get(key)
+        #     if isinstance(value, torch.Tensor):
+        #         transformed_info[f"stage0_{key}"] = value.detach().cpu().contiguous()
 
         _populate_missing_stage0_fields(
             transformed_info,
@@ -615,6 +615,7 @@ def vlm2trajectory(
             output_token_ids_list=output_token_ids_list,
             prompt_mrope_position_delta=prompt_mrope_position_delta,
         )
+        # logger.info(f"vlm2trajectory transformed additional_information {transformed_info}" )
 
         trajectory_inputs.append(
             OmniTextPrompt(

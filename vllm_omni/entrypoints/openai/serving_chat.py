@@ -2345,3 +2345,259 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 code=status_code,
             )
         )
+
+
+class OmniStructuredOutputOpenAIServingChat(OmniOpenAIServingChat):
+    """OpenAI chat serving with extra prompt metadata and structured outputs."""
+
+    @staticmethod
+    def _to_jsonable(value: Any) -> Any:
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().tolist()
+        if isinstance(value, dict):
+            return {str(k): OmniStructuredOutputOpenAIServingChat._to_jsonable(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [OmniStructuredOutputOpenAIServingChat._to_jsonable(v) for v in value]
+        if hasattr(value, "tolist") and not isinstance(value, (bytes, bytearray)):
+            try:
+                return value.tolist()
+            except Exception:
+                pass
+        return repr(value)
+
+    @staticmethod
+    def _get_or_create_additional_information(engine_prompt: TokPrompt) -> dict[str, Any]:
+        additional_information = engine_prompt.get("additional_information")
+        if additional_information is None:
+            additional_information = {}
+            engine_prompt["additional_information"] = additional_information
+        elif not isinstance(additional_information, dict):
+            raise ValueError("engine_prompt.additional_information must be a JSON object")
+        return additional_information
+
+    async def _preprocess_chat(
+        self,
+        request: ChatLikeRequest | ResponsesRequest,
+        messages: list[ChatCompletionMessageParam],
+        default_template: str | None,
+        default_template_content_format: ChatTemplateContentFormatOption,
+        default_template_kwargs: dict[str, Any] | None = None,
+        tool_dicts: list[dict[str, Any]] | None = None,
+        tool_parser: Callable[[TokenizerLike], ToolParser] | None = None,
+        renderer: BaseRenderer | None = None,
+        add_generation_prompt: bool = True,
+        continue_final_message: bool = False,
+        documents: list[dict[str, str]] | None = None,
+        add_special_tokens: bool = False,
+    ) -> tuple[list[ConversationMessage], list[TokPrompt]]:
+        conversation, engine_prompts = await super()._preprocess_chat(
+            request=request,
+            messages=messages,
+            default_template=default_template,
+            default_template_content_format=default_template_content_format,
+            default_template_kwargs=default_template_kwargs,
+            tool_dicts=tool_dicts,
+            tool_parser=tool_parser,
+            renderer=renderer,
+            add_generation_prompt=add_generation_prompt,
+            continue_final_message=continue_final_message,
+            documents=documents,
+            add_special_tokens=add_special_tokens,
+        )
+
+        engine_prompt = engine_prompts[0]
+        request_additional_information = getattr(request, "additional_information", None)
+        if request_additional_information is not None:
+            if not isinstance(request_additional_information, dict):
+                raise ValueError("additional_information must be a JSON object")
+            self._get_or_create_additional_information(engine_prompt).update(request_additional_information)
+
+        speaker = getattr(request, "speaker", None)
+        if isinstance(speaker, str) and speaker.strip():
+            self._get_or_create_additional_information(engine_prompt)["speaker"] = [speaker.lower().strip()]
+
+        language = getattr(request, "language", None)
+        if isinstance(language, str) and language.strip():
+            self._get_or_create_additional_information(engine_prompt)["language"] = [language.strip()]
+
+        return conversation, engine_prompts
+
+    async def chat_completion_full_generator(
+        self,
+        request: ChatCompletionRequest,
+        result_generator: AsyncIterator[RequestOutput],
+        request_id: str,
+        model_name: str,
+        conversation: list[ConversationMessage],
+        tokenizer: TokenizerLike,
+        request_metadata: RequestResponseMetadata,
+        reasoning_parser: ReasoningParser | None = None,
+    ) -> ErrorResponse | OmniChatCompletionResponse:
+        created_time = int(time.time())
+        final_outputs: list[OmniRequestOutput] = []
+        try:
+            async for res in result_generator:
+                final_outputs.append(res)
+        except asyncio.CancelledError:
+            return self.create_error_response("Client disconnected")
+        except ValueError as e:
+            return self.create_error_response(e)
+
+        choices: list[ChatCompletionResponseChoice] = []
+        usage = UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0)
+        role = self.get_chat_request_role(request)
+        prompt_logprobs = None
+        prompt_token_ids = None
+        kv_transfer_params = None
+        response_metrics: dict[str, Any] | None = None
+        include_custom_output = bool(getattr(request, "return_custom_output", False))
+        requested_modalities = (
+            set(request.modalities) if hasattr(request, "modalities") and request.modalities else None
+        )
+
+        for omni_outputs in final_outputs:
+            choices_data = []
+            if omni_outputs.request_output is not None and not getattr(omni_outputs.request_output, "finished", False):
+                continue
+
+            if requested_modalities is not None and omni_outputs.final_output_type not in requested_modalities:
+                logger.warning(f"final output type: {omni_outputs.final_output_type} is not needed by the request")
+                continue
+
+            if omni_outputs.final_output_type == "text":
+                (
+                    choices_data,
+                    usage,
+                    prompt_logprobs,
+                    prompt_token_ids,
+                    kv_transfer_params,
+                ) = self._create_text_choice(
+                    request,
+                    omni_outputs,
+                    tokenizer,
+                    conversation,
+                    role,
+                    reasoning_parser,
+                )
+            elif omni_outputs.final_output_type == "audio":
+                choices_data = self._create_audio_choice(omni_outputs, role, request, stream=False)
+            elif omni_outputs.final_output_type == "image":
+                choices_data = self._create_image_choice(omni_outputs, role, request, stream=False)
+            elif omni_outputs.final_output_type == "trajectory":
+                (
+                    choices_data,
+                    usage,
+                    prompt_token_ids,
+                    kv_transfer_params,
+                ) = self._create_trajectory_choice(omni_outputs, role, request)
+            else:
+                logger.warning(f"Unsupported final output type: {omni_outputs.final_output_type}")
+                continue
+
+            if omni_outputs.metrics:
+                response_metrics = dict(omni_outputs.metrics)
+            if include_custom_output and omni_outputs.custom_output:
+                if response_metrics is None:
+                    response_metrics = {}
+                response_metrics["custom_output"] = self._to_jsonable(omni_outputs.custom_output)
+            choices.extend(choices_data)
+
+        response = OmniChatCompletionResponse(
+            id=request_id,
+            created=created_time,
+            model=model_name,
+            choices=choices,
+            usage=usage,
+            prompt_logprobs=prompt_logprobs,
+            prompt_token_ids=prompt_token_ids,
+            kv_transfer_params=kv_transfer_params,
+            metrics=response_metrics,
+        )
+
+        if self.enable_log_outputs and self.request_logger:
+            for choice in choices:
+                output_text = ""
+                if choice.message.content:
+                    output_text = choice.message.content
+                elif choice.message.tool_calls:
+                    tool_call_descriptions = []
+                    for tc in choice.message.tool_calls:
+                        if hasattr(tc.function, "name") and hasattr(tc.function, "arguments"):
+                            tool_call_descriptions.append(f"{tc.function.name}({tc.function.arguments})")
+                    tool_calls_str = ", ".join(tool_call_descriptions)
+                    output_text = f"[tool_calls: {tool_calls_str}]"
+
+                if output_text:
+                    self.request_logger.log_outputs(
+                        request_id=request_id,
+                        outputs=output_text,
+                        output_token_ids=None,
+                        finish_reason=choice.finish_reason,
+                        is_streaming=False,
+                        delta=False,
+                    )
+
+        return response
+
+    def _create_trajectory_choice(
+        self,
+        omni_outputs: OmniRequestOutput,
+        role: str,
+        request: ChatCompletionRequest,
+    ) -> tuple[
+        list[ChatCompletionResponseChoice],
+        UsageInfo,
+        list[int] | None,
+        Any,
+    ]:
+        final_res = omni_outputs.request_output
+        outputs = list(getattr(final_res, "outputs", []) or [])
+        content = "Trajectory generation completed. See metrics.custom_output for structured outputs."
+        choices: list[ChatCompletionResponseChoice] = []
+
+        if outputs:
+            for output in outputs:
+                choices.append(
+                    ChatCompletionResponseChoice(
+                        index=output.index,
+                        message=ChatMessage(role=role, content=content),
+                        logprobs=None,
+                        finish_reason=output.finish_reason if output.finish_reason else "stop",
+                        stop_reason=output.stop_reason,
+                        token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
+                    )
+                )
+        else:
+            choices.append(
+                ChatCompletionResponseChoice(
+                    index=0,
+                    message=ChatMessage(role=role, content=content),
+                    logprobs=None,
+                    finish_reason="stop",
+                    stop_reason=None,
+                    token_ids=None,
+                )
+            )
+
+        prompt_token_ids_raw = getattr(final_res, "prompt_token_ids", None)
+        encoder_prompt_token_ids = getattr(final_res, "encoder_prompt_token_ids", None)
+        num_prompt_tokens = len(prompt_token_ids_raw) if prompt_token_ids_raw is not None else 0
+        if encoder_prompt_token_ids is not None:
+            num_prompt_tokens += len(encoder_prompt_token_ids)
+        num_generated_tokens = sum(len(output.token_ids) for output in outputs)
+        usage = UsageInfo(
+            prompt_tokens=num_prompt_tokens,
+            completion_tokens=num_generated_tokens,
+            total_tokens=num_prompt_tokens + num_generated_tokens,
+        )
+        if self.enable_prompt_tokens_details and getattr(final_res, "num_cached_tokens", None):
+            usage.prompt_tokens_details = PromptTokenUsageInfo(cached_tokens=final_res.num_cached_tokens)
+
+        return (
+            choices,
+            usage,
+            prompt_token_ids_raw if request.return_token_ids else None,
+            getattr(final_res, "kv_transfer_params", None),
+        )
