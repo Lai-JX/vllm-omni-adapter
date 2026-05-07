@@ -1,0 +1,146 @@
+# Alpamayo1.5 VLA Model Deployment Configuration
+# Two-stage pipeline: real VLM backbone -> Alpamayo trajectory head
+
+async_chunk: false
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    is_comprehension: true
+
+    runtime:
+      devices: "0"
+      requires_multimodal_data: true
+
+    renderer_rewrite_func: "vllm_omni.model_executor.stage_input_processors.alpamayo1_5.build_alpamayo_stage0_renderer"
+    prompt_rewrite_func: "vllm_omni.model_executor.stage_input_processors.alpamayo1_5.rewrite_stage0_prompt_for_vllm_multimodal"
+    request_postprocess_func: "vllm_omni.model_executor.stage_input_processors.alpamayo1_5.postprocess_stage0_request_for_traj_fusion"
+
+    engine_args:
+      model_stage: vlm_reasoner
+      model_arch: Alpamayo1_5Qwen3VLForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      model_subdir: ${oc.env:MODEL_PATH,}
+      tokenizer_subdir: /share/models/Cosmos-Reason2-8B
+      hf_overrides:
+        architectures: ["Alpamayo1_5Qwen3VLForConditionalGeneration"]
+      trust_remote_code: true
+      enforce_eager: false
+      async_scheduling: true
+      enable_prefix_caching: false
+      engine_output_type: latent
+      gpu_memory_utilization: 0.90
+      max_num_seqs: 8
+      max_num_batched_tokens: 27648
+      max_model_len: 8192
+      tensor_parallel_size: 1
+      dtype: bfloat16
+      logits_processors:
+        - "vllm_omni.model_executor.stage_input_processors.alpamayo1_5_stop_after_future_start:AlpamayoStopAfterFutureStartLogitsProcessor"
+      omni_kv_config:
+        need_send_cache: true
+        kv_transfer_criteria:
+          type: special_token
+          # Trigger KV transfer on the forced extra stop token, not on
+          # <|traj_future_start|> itself, so the transferred cache has already
+          # advanced one step past the future-start boundary like the original
+          # HF StopAfterEOS behavior.
+          token_id: 151643
+      profiler_config:
+        profiler: torch
+        torch_profiler_dir: ${oc.env:PROFILER_DIR,./profiler}
+        torch_profiler_record_shapes: true
+        torch_profiler_with_memory: true
+        torch_profiler_with_stack: true
+        torch_profiler_use_gzip: false
+
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+
+    # Sampling parameters
+    default_sampling_params:
+      temperature: 0.6
+      top_p: 0.98
+      top_k: 40
+      max_tokens: 256
+      # Generate <|traj_future_start|>, then force one extra pad token so the
+      # transferred KV cache has advanced through the future-start boundary.
+      stop_token_ids: [151643]
+      extra_args:
+        alpamayo_stop_after_token_id: 155681
+        alpamayo_forced_stop_token_id: 151643
+      detokenize: false
+
+  - stage_id: 1
+    stage_type: diffusion
+    engine_input_source: [0]
+    final_output: true
+    final_output_type: trajectory
+
+    runtime:
+      devices: "0"
+
+    engine_args:
+      model_stage: trajectory_head
+      model_class_name: Alpamayo1_5TrajectoryPipeline
+      trust_remote_code: true
+      enforce_eager: false
+      distributed_executor_backend: mp
+      num_gpus: 1
+      gpu_memory_utilization: 0.4
+      max_num_seqs: 8
+      omni_kv_config:
+        need_recv_cache: true
+        recv_timeout: 120.0
+      profiler_config:
+        profiler: torch
+        torch_profiler_dir: ${oc.env:PROFILER_DIR,./profiler}
+        torch_profiler_record_shapes: true
+        torch_profiler_with_memory: true
+        torch_profiler_with_stack: true
+        torch_profiler_use_gzip: false
+
+    custom_process_input_func: "vllm_omni.model_executor.stage_input_processors.alpamayo1_5.vlm2trajectory"
+
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+
+    default_sampling_params:
+      seed: 42
+      num_inference_steps: 10
+      guidance_scale: 7.5 # Do not take effect for the current deterministic trajectory head, but set it for future non-deterministic versions.
+
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+
+  connectors:
+    connector_of_shared_memory:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 65536
+        connector_get_sleep_s: 0.01
+        connector_get_max_wait_first_chunk: 3000
+        connector_get_max_wait: 1800
+
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1
+
+# Platform-specific overrides
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        engine_args:
+          enforce_eager: false
+
+  rocm:
+    stages:
+      - stage_id: 0
+        engine_args:
+          dtype: float16  # ROCm may prefer float16
