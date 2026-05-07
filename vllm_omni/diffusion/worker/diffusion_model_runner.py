@@ -241,12 +241,22 @@ class DiffusionModelRunner:
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
+            kv_transfer_ms = 0.0
             if bool(getattr(req.sampling_params, "need_kv_receive", True)):
+                t_kv_start = time.perf_counter()
                 self.kv_transfer_manager.receive_multi_kv_cache_distributed(
                     req,
                     cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
                     target_device=getattr(self.pipeline, "device", None),
                 )
+                kv_transfer_ms = (time.perf_counter() - t_kv_start) * 1000.0
+                if req.sampling_params is not None:
+                    # Top-level s1 segment timing for ratio check.
+                    req.sampling_params._kv_receive_ms = kv_transfer_ms
+                    # Extract s0-side KV transfer time from received metadata
+                    kv_meta = getattr(req, "kv_metadata", None) or {}
+                    if isinstance(kv_meta, dict):
+                        req.sampling_params._kv_tran_s0_ms = kv_meta.get("kv_tran_s0_ms", 0.0)
 
             if req.sampling_params.generator is None and req.sampling_params.seed is not None:
                 if req.sampling_params.generator_device is not None:
@@ -256,6 +266,9 @@ class DiffusionModelRunner:
                 else:
                     gen_device = self.device
                 req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
+
+            # Top-level diffusion segment starts before refresh + forward.
+            t_diff_start = time.perf_counter()
 
             # Refresh cache context if needed
             if (
@@ -273,6 +286,10 @@ class DiffusionModelRunner:
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 with record_function("pipeline_forward"):
                     output = self.pipeline.forward(req)
+
+            diffusion_ms = (time.perf_counter() - t_diff_start) * 1000.0
+            if req.sampling_params is not None:
+                req.sampling_params._s1_diffusion_ms = diffusion_ms
 
             if is_primary:
                 self._record_peak_memory(output)

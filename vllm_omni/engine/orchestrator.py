@@ -103,6 +103,11 @@ class OrchestratorRequestState:
     # Metrics: timestamp when request was submitted to each stage
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
 
+    # Stage-0 (LLM) timing & token counts — cached so the final
+    # output message can carry them to the API layer.
+    stage0_gen_time_ms: float = 0.0
+    stage0_num_tokens_in: int = 0
+
 
 class Orchestrator:
     """Runs inside a background thread's asyncio event loop.
@@ -345,9 +350,19 @@ class Orchestrator:
                     "metrics": stage_metrics,
                     "finished": finished and stage_id == req_state.final_stage_id,
                     "stage_submit_ts": submit_ts,
+                    "stage0_gen_time_ms": req_state.stage0_gen_time_ms,
+                    "stage0_num_tokens_in": req_state.stage0_num_tokens_in,
                 }
             )
         elif stage_metrics is not None:
+            # Cache stage-0 (LLM) timing for the final output message
+            if stage_id == 0:
+                req_state.stage0_gen_time_ms = float(
+                    getattr(stage_metrics, "stage_gen_time_ms", 0.0) or 0.0
+                )
+                req_state.stage0_num_tokens_in = int(
+                    getattr(stage_metrics, "num_tokens_in", 0) or 0
+                )
             await self.output_async_queue.put(
                 {
                     "type": "stage_metrics",
@@ -514,8 +529,9 @@ class Orchestrator:
 
         # Build and submit requests for each input
         for next_input in next_inputs:
+            stage_req_id = f"{req_id}-s{next_stage_id}"
             request = build_engine_core_request_from_tokens(
-                request_id=req_id,
+                request_id=stage_req_id,
                 prompt=next_input,
                 params=params,
                 model_config=self.stage_vllm_configs[next_stage_id].model_config,
@@ -664,14 +680,15 @@ class Orchestrator:
         for next_stage_id in range(1, req_state.final_stage_id + 1):
             next_client = self.stage_clients[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
+            stage_req_id = f"{request_id}-s{next_stage_id}"
 
             if next_client.stage_type == "diffusion":
-                await next_client.add_request_async(request_id, req_state.prompt, params)
+                await next_client.add_request_async(stage_req_id, req_state.prompt, params)
                 req_state.stage_submit_ts[next_stage_id] = _time.time()
                 continue
 
             request = build_engine_core_request_from_tokens(
-                request_id=request_id,
+                request_id=stage_req_id,
                 prompt=base_input,
                 params=params,
                 model_config=self.stage_vllm_configs[next_stage_id].model_config,

@@ -117,6 +117,7 @@ class OmniBase:
         self._stage_meta_list = [
             types.SimpleNamespace(**self.engine.get_stage_metadata(i)) for i in range(self.engine.num_stages)
         ]
+        self._stage_gen_cache: dict[str, dict[int, float]] = {}
 
         logger.info(
             "[%s] Initialized with %s stages for model %s",
@@ -260,6 +261,12 @@ class OmniBase:
         if finished and _m is not None:
             metrics.on_stage_metrics(stage_id, req_id, _m)
 
+        # ── Cache per-stage gen time for all stages ──
+        if _m is not None and not isinstance(_m, dict):
+            stage_gen = getattr(_m, "stage_gen_time_ms", None)
+            if stage_gen is not None:
+                self._stage_gen_cache.setdefault(req_id, {})[stage_id] = float(stage_gen)
+
         stage_meta = self.engine.get_stage_metadata(stage_id)
         if not stage_meta["final_output"]:
             return None
@@ -276,12 +283,37 @@ class OmniBase:
             logger.exception("[%s] Finalize request handling error", self.__class__.__name__)
 
         images = getattr(engine_outputs, "images", []) if stage_meta["final_output_type"] == "image" else []
+        req_state = self.request_states.get(req_id)
+
+        # ── Stage times ──
+        # stage-1 comes from our gen cache; stage-0 is passed by orchestrator
+        stage0_ms = float(result.get("stage0_gen_time_ms", 0.0))
+        stage1_ms = float(self._stage_gen_cache.pop(req_id, {}).get(1, 0.0))
+
+        output_metrics: dict[str, Any] = {
+            "stage0_llm_ms": stage0_ms,
+            "stage1_diffusion_ms": stage1_ms,
+        }
+
+        # ── Token counts from orchestrator ──
+        inp_tok = result.get("stage0_num_tokens_in")
+        if inp_tok:
+            output_metrics["input_tokens"] = int(inp_tok)
+
+        # Carry extra dict fields from last-stage metrics
+        if isinstance(_m, dict):
+            for k, v in _m.items():
+                if k not in output_metrics:
+                    output_metrics[k] = v
+
         return OmniRequestOutput(
             request_id=req_id or "",
             stage_id=stage_id,
             final_output_type=stage_meta["final_output_type"],
             request_output=engine_outputs,
             images=images,
+            metrics=output_metrics,
+            _custom_output=getattr(engine_outputs, "custom_output", {}) or {},
             stage_durations=stage_durations,
             peak_memory_mb=peak_memory_mb,
         )

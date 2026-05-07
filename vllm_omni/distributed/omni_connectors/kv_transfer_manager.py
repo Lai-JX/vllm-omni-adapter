@@ -201,13 +201,17 @@ class OmniKVTransferManager:
                     logger.warning(f"Request {req_id} has no block IDs, skipping")
                     continue
 
-                custom_metadata = data.get("custom_metadata")
+                t0 = time.time()
+                custom_metadata = data.get("custom_metadata") or {}
 
                 # Extract KV cache from GPU blocks -> CPU tensors
                 kv_data = self._extract_kv_cache(
                     req_id, block_ids, seq_len, kv_caches, block_size, cache_dtype, custom_metadata
                 )
                 if kv_data:
+                    # Record s0-side KV transfer time in metadata
+                    kv_data.metadata["kv_tran_s0_ms"] = (time.time() - t0) * 1000.0
+
                     # Resolve global request ID if available
                     transfer_req_id = request_id_resolver(req_id) if request_id_resolver else req_id
 
@@ -509,6 +513,7 @@ class OmniKVTransferManager:
         Returns:
             True if primary KV cache was received successfully.
         """
+        t0 = time.perf_counter()
         primary_ok = self.receive_kv_cache(req, target_device)
 
         cfg_ids = getattr(getattr(req, "sampling_params", None), "cfg_kv_request_ids", None)
@@ -529,6 +534,10 @@ class OmniKVTransferManager:
                     logger.info("Applied CFG KV caches: %s", list(cfg_kvs.keys()))
             except Exception:
                 logger.exception("Failed to collect CFG KV caches for %s", request_id)
+
+        kv_receive_ms = (time.perf_counter() - t0) * 1000.0
+        if hasattr(req, "sampling_params") and req.sampling_params is not None:
+            req.sampling_params._kv_receive_ms = kv_receive_ms
 
         return primary_ok
 

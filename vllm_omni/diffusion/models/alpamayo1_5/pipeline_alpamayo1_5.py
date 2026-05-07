@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time as _time
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,24 @@ from vllm_omni.diffusion.models.alpamayo1_5.runtime import (
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 logger = init_logger(__name__)
+
+
+def _flatten_cot(cot_tensor: torch.Tensor):
+    """Flatten cot_token_ids to a 1-D list.
+
+    ``cot_tensor`` may have shape ``(num_traj_sets, num_samples, N)``
+    or ``(num_samples, N)``.  Flatten across samples so that
+    ``len(result) == N * num_samples``.
+    """
+    if cot_tensor is None:
+        return []
+    if cot_tensor.dim() == 1:
+        return cot_tensor.tolist()
+    if cot_tensor.numel() == 0:
+        return []
+    # (num_samples, N) → list of N tokens (first sample) or flatten all
+    flat = cot_tensor.reshape(-1).tolist()
+    return flat
 
 
 class Alpamayo1_5TrajectoryPipeline(nn.Module):
@@ -649,7 +668,7 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
         future_steps: int,
         num_inference_steps: int,
         guidance_scale: float,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, float, float]:
         if not self._reference_modules_ready:
             raise RuntimeError(
                 "Alpamayo1_5 diffusion pipeline is not initialized with reference stage-1 modules."
@@ -660,6 +679,7 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
         assert self.action_out_proj is not None
         assert self.expert is not None
 
+        t_kv_start = _time.time()
         hist_xyz_rep = hist_xyz.repeat_interleave(total_samples, dim=0)
         hist_rot_rep = hist_rot.repeat_interleave(total_samples, dim=0)
 
@@ -676,6 +696,7 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             prefix_mask,
             initial_noise_x0,
         ) = prepared
+        t_kv_end = _time.time()
         prefill_seq_len = prompt_cache.get_seq_length()
         n_diffusion_tokens = self.action_space.get_action_space_dims()[0]
         expected_x_shape = tuple(int(dim) for dim in self.diffusion.x_dims)
@@ -824,12 +845,16 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
         )
         pred_xyz = pred_xyz.view(num_traj_sets, num_samples, future_steps, 3).detach()
         pred_rot = pred_rot.view(num_traj_sets, num_samples, future_steps, 3, 3).detach()
-        return pred_xyz, pred_rot
+        t_diff_end = _time.time()
+        kv_ms = (t_kv_end - t_kv_start) * 1000.0
+        diff_ms = (t_diff_end - t_kv_end) * 1000.0
+        return pred_xyz, pred_rot, kv_ms, diff_ms
 
     def forward(
         self,
         req: OmniDiffusionRequest,
     ) -> DiffusionOutput:
+        t_forward_start = _time.time()
         if self._is_dummy_warmup(req):
             future_steps = self.default_future_steps
             dummy_xyz = torch.zeros((1, 1, future_steps, 3), dtype=torch.float32)
@@ -861,6 +886,8 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
         pred_xyz_list: list[torch.Tensor] = []
         pred_rot_list: list[torch.Tensor] = []
         cot_ids_list: list[torch.Tensor] = []
+        kv_ms_list: list[float] = []
+        diff_ms_list: list[float] = []
 
         for info in infos:
             rollout_source = info.get("stage0_sequences")
@@ -907,7 +934,7 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             hist_rot_ref = self._as_hist_rot(hist_rot, hist_xyz_ref, device)
             req_id = str(req.request_ids[0]) if getattr(req, "request_ids", None) else "unknown"
 
-            pred_xyz, pred_rot = self._sample_with_rollout_context(
+            pred_xyz, pred_rot, kv_ms, diff_ms = self._sample_with_rollout_context(
                 req_id=req_id,
                 info=info,
                 sampling_params=req.sampling_params,
@@ -942,12 +969,25 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             pred_xyz_list.append(pred_xyz.cpu())
             pred_rot_list.append(pred_rot.cpu())
             cot_ids_list.append(cot_ids.cpu())
+            kv_ms_list.append(float(kv_ms))
+            diff_ms_list.append(float(diff_ms))
 
+        forward_total_ms = (_time.time() - t_forward_start) * 1000.0
+        diffusion_ms = getattr(req.sampling_params, "_s1_diffusion_ms", forward_total_ms)
+        kv_transfer_ms = getattr(req.sampling_params, "_kv_receive_ms", 0.0)
         custom_output: dict[str, Any] = {
             "pred_xyz": pred_xyz_list[0] if len(pred_xyz_list) == 1 else pred_xyz_list,
             "pred_rot": pred_rot_list[0] if len(pred_rot_list) == 1 else pred_rot_list,
-            "cot_token_ids": cot_ids_list[0] if len(cot_ids_list) == 1 else cot_ids_list,
+            "cot_token_ids": _flatten_cot(cot_ids_list[0] if len(cot_ids_list) == 1 else cot_ids_list),
             "stage0_context_used": getattr(req.sampling_params, "past_key_values", None) is not None,
+            "kv_tran_s0_ms": getattr(req.sampling_params, "_kv_tran_s0_ms", 0.0),
+            "kv_tran_s1_receive_ms": kv_transfer_ms,
+            "kv_tran_s1_prep_ms": kv_ms_list[0] if len(kv_ms_list) == 1 else kv_ms_list,
+            "df_ms": diffusion_ms,
+            "stage1_forward_total_ms": forward_total_ms,
+            "stage1_diffusion_inner_ms": diff_ms_list[0] if len(diff_ms_list) == 1 else diff_ms_list,
+            "kv_transfer_runner_ms": kv_transfer_ms,
+            "diffusion_runner_ms": diffusion_ms,
         }
         trajectory_latents = pred_xyz_list[0] if len(pred_xyz_list) == 1 else None
         return DiffusionOutput(

@@ -292,19 +292,22 @@ class OrchestratorAggregator:
                 output_to_yield.metrics = {}
                 return
 
-            # 4. Finished with output: assign text metrics if available
-            output_to_yield.metrics = {}
+            # 4. Finished with output: expose inference-only timing in response metrics.
+            # This is the sum of stage generation time and excludes client/network/queue time.
+            output_to_yield.metrics = {
+                "inference_only_ms": float(sum(self.accumulated_gen_time_ms[req_id].values())),
+            }
             stage_event = next(
                 (evt for evt in reversed(self.stage_events.get(req_id, [])) if evt.stage_id == stage_id),
                 None,
             )
-            if stage_event is not None and stage_event.final_output_type == "text":
-                output_to_yield.metrics = {
-                    "num_tokens_in": stage_event.num_tokens_in,
-                    "num_tokens_out": stage_event.num_tokens_out,
-                    "stage_id": stage_event.stage_id,
-                    "final_output_type": stage_event.final_output_type,
-                }
+            if stage_event is not None:
+                output_to_yield.metrics["stage_gen_time_ms"] = float(stage_event.stage_gen_time_ms)
+                output_to_yield.metrics["stage_id"] = stage_event.stage_id
+                output_to_yield.metrics["final_output_type"] = stage_event.final_output_type
+                if stage_event.final_output_type == "text":
+                    output_to_yield.metrics["num_tokens_in"] = stage_event.num_tokens_in
+                    output_to_yield.metrics["num_tokens_out"] = stage_event.num_tokens_out
 
             # 5. Finished: record audio generated frames
             self.record_audio_generated_frames(output_to_yield, stage_id, req_id)

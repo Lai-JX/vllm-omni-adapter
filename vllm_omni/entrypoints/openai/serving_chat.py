@@ -1491,6 +1491,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         reasoning_parser: ReasoningParser | None = None,
     ) -> ErrorResponse | OmniChatCompletionResponse:
         created_time = int(time.time())
+        _arrival_ts = time.perf_counter()
         final_res: RequestOutput | None = None
 
         final_outputs: list[OmniRequestOutput] = []
@@ -1553,6 +1554,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if omni_outputs.metrics:
                 response_metrics = omni_outputs.metrics
             choices.extend(choices_data)
+
+        _server_total_ms = (time.perf_counter() - _arrival_ts) * 1000.0
+        if response_metrics is None:
+            response_metrics = {}
+        response_metrics["server_total_ms"] = _server_total_ms
+        response_metrics["inference_only_ms"] = _server_total_ms
 
         response = OmniChatCompletionResponse(
             id=request_id,
@@ -2436,6 +2443,7 @@ class OmniStructuredOutputOpenAIServingChat(OmniOpenAIServingChat):
         reasoning_parser: ReasoningParser | None = None,
     ) -> ErrorResponse | OmniChatCompletionResponse:
         created_time = int(time.time())
+        _arrival_ts = time.perf_counter()
         final_outputs: list[OmniRequestOutput] = []
         try:
             async for res in result_generator:
@@ -2503,6 +2511,12 @@ class OmniStructuredOutputOpenAIServingChat(OmniOpenAIServingChat):
                     response_metrics = {}
                 response_metrics["custom_output"] = self._to_jsonable(omni_outputs.custom_output)
             choices.extend(choices_data)
+
+        _server_total_ms = (time.perf_counter() - _arrival_ts) * 1000.0
+        if response_metrics is None:
+            response_metrics = {}
+        response_metrics["server_total_ms"] = _server_total_ms
+        response_metrics["inference_only_ms"] = _server_total_ms
 
         response = OmniChatCompletionResponse(
             id=request_id,

@@ -485,17 +485,24 @@ class OmniARScheduler(VLLMScheduler):
         """Mark a request as finished and free its resources."""
         assert request.is_finished()
 
-        # 1. Standard cleanup parts from base _free_request
+        request_id = request.request_id
+
+        # 1a. Capture KV transfer block IDs BEFORE _connector_finished removes them
+        should_transfer = self._should_transfer_kv_for_request(request_id)
+        if should_transfer and request_id not in self.transfer_triggered_requests:
+            self.waiting_for_transfer_free.add(request_id)
+            self._mark_request_for_kv_transfer(request_id, request.num_computed_tokens)
+
+        # 1b. Standard cleanup parts from base _free_request
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
 
         self.encoder_cache_manager.free(request)
-        request_id = request.request_id
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
 
         # 2. Omni Specific: Check if we need to transfer KV
-        if self._should_transfer_kv_for_request(request_id):
+        if should_transfer:
             already_triggered = request_id in self.transfer_triggered_requests
             is_active = request_id in self.active_kv_transfers
 
@@ -504,28 +511,24 @@ class OmniARScheduler(VLLMScheduler):
                     # It triggered but hasn't finished yet. We MUST wait.
                     logger.debug(f"[Omni] Request {request_id} finished but transfer is still ACTIVE. Waiting.")
                     self.waiting_for_transfer_free.add(request_id)
-                    # We do NOT mark for transfer again, just wait.
-                    kv_xfer_params = None  # No new transfer params
-                    return kv_xfer_params
+                    return None
                 else:
+                    # Transfer was extracted/acked; blocks no longer needed.
                     logger.debug(
                         f"[Omni] Request {request_id} finished and transfer no longer ACTIVE (extracted/acked). "
                         "Freeing immediately."
                     )
+                    self._free_blocks(request)
+                    return kv_xfer_params
             else:
-                self.waiting_for_transfer_free.add(request_id)
-                self._mark_request_for_kv_transfer(request_id, request.num_computed_tokens)
-                # Return KV transfer metadata so it propagates to RequestOutput
+                # Block IDs already captured above (step 1a). Build params now.
                 if request_id in self.requests_needing_kv_transfer:
                     transfer_data = self.requests_needing_kv_transfer[request_id]
                     kv_xfer_params = {
                         "past_key_values": transfer_data["block_ids"],
                         "kv_metadata": {"seq_len": transfer_data["seq_len"], "block_ids": transfer_data["block_ids"]},
                     }
-                    # Also update request.additional_information for good measure
                     add_info = getattr(request, "additional_information", None)
-                    # If additional_information is an AdditionalInformationPayload-like object,
-                    # unpack it into a plain dict.
                     if (
                         add_info is not None
                         and hasattr(add_info, "entries")
@@ -539,9 +542,11 @@ class OmniARScheduler(VLLMScheduler):
                     if isinstance(add_info, dict):
                         add_info.update(kv_xfer_params)
 
+                # Blocks captured for transfer, safe to free them now
+                self._free_blocks(request)
                 return kv_xfer_params
 
-        # 3. Standard Freeing
+        # 3. Standard Freeing (non-omni requests)
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
             self._free_blocks(request)
@@ -565,6 +570,13 @@ class OmniARScheduler(VLLMScheduler):
                 block_ids_tuple = self.kv_cache_manager.get_block_ids(req_id)
                 if block_ids_tuple and len(block_ids_tuple) > 0:
                     block_ids = block_ids_tuple[0]
+                    logger.debug(f"[Omni] KV: get_block_ids({req_id}) -> {len(block_ids)} blocks")
+                    if len(block_ids) == 0:
+                        logger.warning(f"[Omni] KV: get_block_ids({req_id}) returned 0 blocks in tuple!")
+                        # Debug: check req_to_blocks directly
+                        for mgr in self.kv_cache_manager.coordinator.single_type_managers:
+                            blocks = mgr.req_to_blocks.get(req_id)
+                            logger.warning(f"[Omni] KV: req_to_blocks[{req_id}] = {len(blocks) if blocks else None} blocks")
 
                     # [Omni] Fix: Truncate blocks to match seq_len snapshot
                     # We need to know block_size. Usually in self.cache_config.block_size
