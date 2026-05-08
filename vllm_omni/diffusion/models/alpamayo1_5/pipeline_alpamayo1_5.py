@@ -461,6 +461,37 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
 
         return DynamicCache.from_legacy_cache(tuple(legacy_cache))
 
+    @staticmethod
+    def _select_transferred_kv_sample(transferred_kv: Any, sample_idx: int | None) -> Any:
+        if transferred_kv is None or sample_idx is None:
+            return transferred_kv
+
+        key_cache = getattr(transferred_kv, "key_cache", None)
+        value_cache = getattr(transferred_kv, "value_cache", None)
+        if not isinstance(key_cache, list) or not isinstance(value_cache, list):
+            return transferred_kv
+
+        sliced_key_cache = []
+        sliced_value_cache = []
+        changed = False
+        for k, v in zip(key_cache, value_cache, strict=False):
+            if isinstance(k, torch.Tensor) and k.ndim >= 4 and k.shape[0] > sample_idx:
+                k = k[sample_idx : sample_idx + 1].contiguous()
+                changed = True
+            if isinstance(v, torch.Tensor) and v.ndim >= 4 and v.shape[0] > sample_idx:
+                v = v[sample_idx : sample_idx + 1].contiguous()
+                changed = True
+            sliced_key_cache.append(k)
+            sliced_value_cache.append(v)
+
+        if not changed:
+            return transferred_kv
+
+        return SimpleNamespace(
+            key_cache=sliced_key_cache,
+            value_cache=sliced_value_cache,
+        )
+
     def _prepare_rollout_context(
         self,
         info: dict[str, Any],
@@ -479,6 +510,10 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             raise RuntimeError(
                 "Missing stage-0 KV cache: sampling_params.past_key_values is None."
             )
+        transferred_kv = self._select_transferred_kv_sample(
+            transferred_kv,
+            int(info["stage0_sample_index"]) if info.get("stage0_sample_index") is not None else None,
+        )
 
         sequences = info.get("stage0_sequences")
         if sequences is None:
@@ -580,6 +615,20 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             prefix_mask_tensor,
             initial_noise_x0,
         )
+
+    @staticmethod
+    def _select_sample_slice(value: Any, sample_idx: int) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            if value.ndim == 0 or value.shape[0] <= sample_idx:
+                return value
+            return value[sample_idx : sample_idx + 1].contiguous()
+        if isinstance(value, list):
+            if value and isinstance(value[0], (list, tuple, torch.Tensor)) and sample_idx < len(value):
+                return [value[sample_idx]]
+            return value
+        return value
 
     def _sample_diffusion_euler(
         self,
@@ -907,9 +956,22 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             hist_rot_ref = self._as_hist_rot(hist_rot, hist_xyz_ref, device)
             req_id = str(req.request_ids[0]) if getattr(req, "request_ids", None) else "unknown"
 
+            sample_info = dict(info)
+            stage0_sample_index = sample_info.get("stage0_sample_index")
+            if stage0_sample_index is not None:
+                sample_idx = int(stage0_sample_index)
+                for key in (
+                    "stage0_sequences",
+                    "stage0_output_token_ids",
+                    "stage0_rope_deltas",
+                    "stage0_attention_mask",
+                    "initial_noise_x0",
+                ):
+                    sample_info[key] = self._select_sample_slice(sample_info.get(key), sample_idx)
+
             pred_xyz, pred_rot = self._sample_with_rollout_context(
                 req_id=req_id,
-                info=info,
+                info=sample_info,
                 sampling_params=req.sampling_params,
                 hist_xyz=hist_xyz_ref,
                 hist_rot=hist_rot_ref,
@@ -922,13 +984,13 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             )
 
             output_ids = self._to_padded_long_tensor(
-                info.get("stage0_output_token_ids"),
+                sample_info.get("stage0_output_token_ids"),
                 device=device,
                 pad_value=self.future_end_id if self.future_end_id >= 0 else 0,
             )
             if output_ids is None:
                 output_ids = self._to_padded_long_tensor(
-                    info.get("stage0_sequences"),
+                    sample_info.get("stage0_sequences"),
                     device=device,
                     pad_value=self.future_end_id if self.future_end_id >= 0 else 0,
                 )

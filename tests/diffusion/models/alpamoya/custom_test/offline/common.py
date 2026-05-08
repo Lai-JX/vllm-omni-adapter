@@ -9,7 +9,7 @@ import yaml
 from PIL import Image
 from vllm import SamplingParams
 
-REPO_ROOT = Path(__file__).resolve().parents[5]
+REPO_ROOT = Path(__file__).resolve().parents[6]
 ALPAMAYO_SRC = REPO_ROOT.parent / "alpamayo1.5" / "src"
 
 if str(REPO_ROOT) not in sys.path:

@@ -465,8 +465,6 @@ class Orchestrator:
                     req_state.prompt,   # raw_prompt
                     False,
                 )
-                if isinstance(diffusion_prompt, list):
-                    diffusion_prompt = diffusion_prompt[0]
             else:
                 diffusion_prompt = req_state.prompt
 
@@ -490,9 +488,15 @@ class Orchestrator:
                     req_id,
                     diffusion_prompt,
                     params,
+                    upstream_request_output=output,
                 )
             else:
-                await next_client.add_request_async(req_id, diffusion_prompt, params)
+                await next_client.add_request_async(
+                    req_id,
+                    diffusion_prompt,
+                    params,
+                    upstream_request_output=output,
+                )
             req_state.stage_submit_ts[next_stage_id] = _time.time()
             return
 
@@ -619,7 +623,11 @@ class Orchestrator:
             else:
                 await stage_client.add_request_async(request_id, prompt, params)
         else:
-            await stage_client.add_request_async(request)
+            if isinstance(request, list):
+                for child_request in request:
+                    await stage_client.add_request_async(child_request)
+            else:
+                await stage_client.add_request_async(request)
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
             await self._prewarm_async_chunk_stages(request_id, request, req_state)

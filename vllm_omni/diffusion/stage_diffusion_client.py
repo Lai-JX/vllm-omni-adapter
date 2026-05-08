@@ -58,9 +58,10 @@ class StageDiffusionClient:
         request_id: str,
         prompt: OmniPromptType,
         sampling_params: OmniDiffusionSamplingParams,
+        upstream_request_output: Any | None = None,
     ) -> None:
         task = asyncio.create_task(
-            self._run(request_id, prompt, sampling_params),
+            self._run(request_id, prompt, sampling_params, upstream_request_output),
             name=f"diffusion-{request_id}",
         )
         self._tasks[request_id] = task
@@ -70,9 +71,11 @@ class StageDiffusionClient:
         request_id: str,
         prompt: OmniPromptType,
         sampling_params: OmniDiffusionSamplingParams,
+        upstream_request_output: Any | None,
     ) -> None:
         try:
             result = await self._engine.generate(prompt, sampling_params, request_id)
+            result._upstream_request_output = upstream_request_output
             await self._output_queue.put(result)
         except Exception as e:
             logger.exception(
@@ -91,6 +94,7 @@ class StageDiffusionClient:
         request_id: str,
         prompts: list[OmniPromptType],
         sampling_params: OmniDiffusionSamplingParams,
+        upstream_request_output: Any | None = None,
     ) -> None:
         """Submit a list of prompts as a single batched engine call.
 
@@ -99,7 +103,7 @@ class StageDiffusionClient:
         *request_id*.
         """
         task = asyncio.create_task(
-            self._run_batch(request_id, prompts, sampling_params),
+            self._run_batch(request_id, prompts, sampling_params, upstream_request_output),
             name=f"diffusion-batch-{request_id}",
         )
         self._tasks[request_id] = task
@@ -109,6 +113,7 @@ class StageDiffusionClient:
         request_id: str,
         prompts: list[OmniPromptType],
         sampling_params: OmniDiffusionSamplingParams,
+        upstream_request_output: Any | None,
     ) -> None:
         try:
             result = await self._engine.generate_batch(
@@ -116,6 +121,7 @@ class StageDiffusionClient:
                 sampling_params,
                 request_id,
             )
+            result._upstream_request_output = upstream_request_output
             await self._output_queue.put(result)
         except Exception as e:
             logger.exception(

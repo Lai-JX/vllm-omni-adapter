@@ -18,6 +18,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Sequence
+from copy import copy
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
@@ -29,9 +30,11 @@ import torch
 from omegaconf import OmegaConf
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.engine.parallel_sampling import ParentRequest
 from vllm.v1.engine.utils import get_engine_zmq_addresses, launch_core_engines
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
@@ -719,15 +722,40 @@ class AsyncOmniEngine:
             # output routing (output.request_id lookup) can find the req_state.
             request.external_req_id = request_id
 
-            # Register with stage 0's output processor.
-            self.output_processors[0].add_request(
-                request=request,
-                prompt=prompt,
-                parent_req=None,
-                request_index=0,
-                queue=None,
-            )
-            prompt = request
+            stage0_n = params.n if isinstance(params, SamplingParams) else 1
+            if stage0_n == 1:
+                # Register with stage 0's output processor.
+                self.output_processors[0].add_request(
+                    request=request,
+                    prompt=prompt,
+                    parent_req=None,
+                    request_index=0,
+                    queue=None,
+                )
+                prompt = request
+            else:
+                # Upstream parallel sampling aggregates child completions into one
+                # parent RequestOutput only in FINAL_ONLY mode. The omni
+                # orchestrator expects exactly that aggregated parent output
+                # before forwarding to stage 1.
+                request.sampling_params.output_kind = RequestOutputKind.FINAL_ONLY
+                parent_req = ParentRequest(request)
+                child_requests: list[EngineCoreRequest] = []
+                for idx in range(stage0_n):
+                    child_request_id, child_params = parent_req.get_child_info(idx)
+                    child_request = request if idx == stage0_n - 1 else copy(request)
+                    child_request.request_id = child_request_id
+                    child_request.sampling_params = child_params
+                    child_request.external_req_id = request_id
+                    self.output_processors[0].add_request(
+                        request=child_request,
+                        prompt=prompt,
+                        parent_req=parent_req,
+                        request_index=idx,
+                        queue=None,
+                    )
+                    child_requests.append(child_request)
+                prompt = child_requests
 
         return {
             "type": "add_request",

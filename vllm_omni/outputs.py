@@ -61,6 +61,7 @@ class OmniRequestOutput:
     metrics: dict[str, Any] = field(default_factory=dict)
     _multimodal_output: dict[str, Any] = field(default_factory=dict)
     _custom_output: dict[str, Any] = field(default_factory=dict)
+    _upstream_request_output: RequestOutput | None = None
 
     # profiling data
     stage_durations: dict[str, float] = field(default_factory=dict)
@@ -188,6 +189,8 @@ class OmniRequestOutput:
         """
         if self.request_output is not None:
             return getattr(self.request_output, "prompt_token_ids", None)
+        if self._upstream_request_output is not None:
+            return getattr(self._upstream_request_output, "prompt_token_ids", None)
         return None
 
     @property
@@ -199,6 +202,8 @@ class OmniRequestOutput:
         """
         if self.request_output is not None:
             return getattr(self.request_output, "outputs", [])
+        if self._upstream_request_output is not None:
+            return getattr(self._upstream_request_output, "outputs", [])
         return []
 
     @property
@@ -206,6 +211,8 @@ class OmniRequestOutput:
         """Return encoder prompt token IDs from the underlying request output."""
         if self.request_output is not None:
             return getattr(self.request_output, "encoder_prompt_token_ids", None)
+        if self._upstream_request_output is not None:
+            return getattr(self._upstream_request_output, "encoder_prompt_token_ids", None)
         return None
 
     @property
@@ -213,6 +220,8 @@ class OmniRequestOutput:
         """Return prompt logprobs from the underlying request output."""
         if self.request_output is not None:
             return getattr(self.request_output, "prompt_logprobs", None)
+        if self._upstream_request_output is not None:
+            return getattr(self._upstream_request_output, "prompt_logprobs", None)
         return None
 
     @property
@@ -220,6 +229,8 @@ class OmniRequestOutput:
         """Return number of cached tokens from the underlying request output."""
         if self.request_output is not None:
             return getattr(self.request_output, "num_cached_tokens", None)
+        if self._upstream_request_output is not None:
+            return getattr(self._upstream_request_output, "num_cached_tokens", None)
         return None
 
     @property
@@ -227,6 +238,8 @@ class OmniRequestOutput:
         """Return KV transfer params from the underlying request output."""
         if self.request_output is not None:
             return getattr(self.request_output, "kv_transfer_params", None)
+        if self._upstream_request_output is not None:
+            return getattr(self._upstream_request_output, "kv_transfer_params", None)
         return None
 
     @property

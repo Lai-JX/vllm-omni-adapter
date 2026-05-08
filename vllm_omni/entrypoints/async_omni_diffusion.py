@@ -15,6 +15,7 @@ from collections.abc import AsyncGenerator, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import torch
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
 
@@ -224,7 +225,10 @@ class AsyncOmniDiffusion:
         request = OmniDiffusionRequest(
             prompts=prompts,
             sampling_params=sampling_params,
-            request_ids=[f"{request_id}-{i}" for i in range(len(prompts))],
+            # Keep the original upstream request_id for every prompt in the
+            # batch so stage-1 KV receiving can fetch the shared stage-0 KV
+            # payload that was transferred under the parent request id.
+            request_ids=[request_id for _ in range(len(prompts))],
         )
 
         logger.debug("Starting batch generation for %d prompts, request_id=%s", len(prompts), request_id)
@@ -242,14 +246,62 @@ class AsyncOmniDiffusion:
 
         # Combine all per-prompt results into a single OmniRequestOutput
         all_images = []
+        all_prompts = []
+        all_stage_durations = {}
+        peak_memory_mb = 0.0
+        multimodal_output: dict[str, Any] = {}
+        custom_output_lists: dict[str, list[Any]] = {}
+        trajectory_latents_list: list[Any] = []
         for result in results:
             all_images.extend(result.images)
+            all_prompts.append(result.prompt)
+            all_stage_durations.update(getattr(result, "stage_durations", {}) or {})
+            peak_memory_mb = max(peak_memory_mb, float(getattr(result, "peak_memory_mb", 0.0) or 0.0))
+            if getattr(result, "multimodal_output", None):
+                for key, value in result.multimodal_output.items():
+                    multimodal_output.setdefault(key, [])
+                    multimodal_output[key].append(value)
+            for key, value in (result.custom_output or {}).items():
+                custom_output_lists.setdefault(key, []).append(value)
+            if getattr(result, "latents", None) is not None:
+                trajectory_latents_list.append(result.latents)
+
+        custom_output: dict[str, Any] = {}
+        for key, values in custom_output_lists.items():
+            if not values:
+                continue
+            if len(values) == 1:
+                custom_output[key] = values[0]
+                continue
+            if all(isinstance(v, torch.Tensor) for v in values):
+                try:
+                    custom_output[key] = torch.cat(values, dim=0)
+                    continue
+                except Exception:
+                    pass
+            custom_output[key] = values
+
+        trajectory_latents = None
+        if trajectory_latents_list:
+            if len(trajectory_latents_list) == 1:
+                trajectory_latents = trajectory_latents_list[0]
+            elif all(isinstance(v, torch.Tensor) for v in trajectory_latents_list):
+                try:
+                    trajectory_latents = torch.cat(trajectory_latents_list, dim=0)
+                except Exception:
+                    trajectory_latents = trajectory_latents_list
 
         return OmniRequestOutput(
             request_id=request_id,
             images=all_images,
+            prompt=all_prompts,
             final_output_type="image",
             finished=True,
+            latents=trajectory_latents,
+            _multimodal_output=multimodal_output,
+            _custom_output=custom_output,
+            stage_durations=all_stage_durations,
+            peak_memory_mb=peak_memory_mb,
         )
 
     # ------------------------------------------------------------------

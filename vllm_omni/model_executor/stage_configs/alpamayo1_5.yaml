@@ -84,6 +84,7 @@ stage_args:
     engine_args:
       model_stage: trajectory_head
       model_arch: Alpamayo1_5TrajectoryPipeline
+      model_subdir: /share/models/Alpamayo-1.5-10B
       trust_remote_code: true
       enforce_eager: false
       distributed_executor_backend: mp
