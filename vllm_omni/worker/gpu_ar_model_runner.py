@@ -89,6 +89,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
         with maybe_disable_pin_memory_for_ray(self, total_bytes):
             return super()._make_buffer(*size, dtype=dtype, numpy=numpy)
 
+    def get_kv_connector_connection_info(self) -> dict[str, Any] | None:
+        """Return sender connector info for stage orchestration."""
+        return self.kv_transfer_manager.get_connector_connection_info()
+
     @torch.inference_mode()
     def execute_model(
         self,

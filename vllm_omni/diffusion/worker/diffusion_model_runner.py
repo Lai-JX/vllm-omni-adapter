@@ -75,6 +75,10 @@ class DiffusionModelRunner:
         # Initialize KV cache manager for connector management
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
 
+    def update_kv_receiver_sender_info(self, sender_host: str, sender_zmq_port: int) -> bool:
+        """Inject sender info into the receiver-side KV connector."""
+        return self.kv_transfer_manager.update_receiver_sender_info(sender_host, sender_zmq_port)
+
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
         model = getattr(self.pipeline, attr_name, None)

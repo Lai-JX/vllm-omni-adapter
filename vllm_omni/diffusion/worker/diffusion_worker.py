@@ -222,6 +222,18 @@ class DiffusionWorker:
                 logger.warning("LoRA activation skipped: %s", exc)
         return self.model_runner.execute_model(req)
 
+    def update_kv_receiver_sender_info(self, sender_host: str, sender_zmq_port: int) -> bool:
+        """Inject sender endpoint into the receiver-side KV connector."""
+        assert self.model_runner is not None, "Model runner not initialized"
+        updated = self.model_runner.update_kv_receiver_sender_info(sender_host, sender_zmq_port)
+        logger.info(
+            "update_kv_receiver_sender_info(host=%s, zmq_port=%s) -> %s",
+            sender_host,
+            sender_zmq_port,
+            updated,
+        )
+        return updated
+
     def execute_stepwise(self, scheduler_output: DiffusionSchedulerOutput) -> RunnerOutput:
         """Execute one diffusion step by delegating to the model runner."""
         assert self.model_runner is not None, "Model runner not initialized"

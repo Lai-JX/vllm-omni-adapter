@@ -457,6 +457,7 @@ class Orchestrator:
         params = req_state.sampling_params_list[next_stage_id]
 
         if next_client.stage_type == "diffusion":
+            await self._maybe_prepare_diffusion_kv_receiver(stage_id, next_stage_id)
             self.stage_clients[stage_id].set_engine_outputs([output])
             if next_client.custom_process_input_func is not None:
                 diffusion_prompt = next_client.custom_process_input_func(
@@ -540,6 +541,79 @@ class Orchestrator:
 
         # Record submit timestamp for the next stage
         req_state.stage_submit_ts[next_stage_id] = _time.time()
+
+    async def _maybe_prepare_diffusion_kv_receiver(self, stage_id: int, next_stage_id: int) -> None:
+        """Inject sender endpoint into a Mooncake-based diffusion receiver.
+
+        SharedMemoryConnector does not need any extra orchestration, but
+        MooncakeTransferEngineConnector requires the receiver to know the
+        sender's ``host`` and ``zmq_port`` before calling
+        ``get(..., metadata=None)`` on the KV receive path.
+        """
+        stage_client = self.stage_clients[stage_id]
+        next_client = self.stage_clients[next_stage_id]
+
+        if not hasattr(stage_client, "collective_rpc_async") or not hasattr(next_client, "collective_rpc_async"):
+            logger.info(
+                "[Orchestrator] Skip diffusion KV receiver prep for stage-%s -> stage-%s: collective_rpc_async missing",
+                stage_id,
+                next_stage_id,
+            )
+            return
+
+        def _unwrap_singleton_rpc_result(value: Any) -> Any:
+            if isinstance(value, list) and len(value) == 1:
+                return value[0]
+            return value
+
+        sender_info = await stage_client.collective_rpc_async("get_kv_connector_connection_info")
+        sender_info = _unwrap_singleton_rpc_result(sender_info)
+        if not isinstance(sender_info, dict):
+            logger.info(
+                "[Orchestrator] Skip diffusion KV receiver prep for stage-%s -> stage-%s: sender_info=%r",
+                stage_id,
+                next_stage_id,
+                sender_info,
+            )
+            return
+
+        sender_host = sender_info.get("host")
+        sender_zmq_port = sender_info.get("zmq_port")
+        can_put = sender_info.get("can_put")
+        if not sender_host or not sender_zmq_port or not can_put:
+            logger.info(
+                "[Orchestrator] Skip diffusion KV receiver prep for stage-%s -> stage-%s: "
+                "host=%r zmq_port=%r can_put=%r",
+                stage_id,
+                next_stage_id,
+                sender_host,
+                sender_zmq_port,
+                can_put,
+            )
+            return
+
+        updated = await next_client.collective_rpc_async(
+            "update_kv_receiver_sender_info",
+            args=(str(sender_host), int(sender_zmq_port)),
+        )
+        updated = _unwrap_singleton_rpc_result(updated)
+        if updated:
+            logger.info(
+                "[Orchestrator] Prepared stage-%s diffusion receiver with sender endpoint %s:%s from stage-%s",
+                next_stage_id,
+                sender_host,
+                sender_zmq_port,
+                stage_id,
+            )
+        else:
+            logger.warning(
+                "[Orchestrator] Diffusion KV receiver prep returned falsy result for stage-%s -> stage-%s "
+                "with sender endpoint %s:%s",
+                stage_id,
+                next_stage_id,
+                sender_host,
+                sender_zmq_port,
+            )
 
     async def _poll_stage_raw(self, stage_id: int) -> EngineCoreOutputs | None:
         """Pull raw EngineCoreOutputs from a stage client without processing.
