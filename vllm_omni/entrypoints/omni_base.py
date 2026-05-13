@@ -77,12 +77,19 @@ class OmniBase:
         stage_init_timeout = kwargs.pop("stage_init_timeout", 300)
         init_timeout = kwargs.pop("init_timeout", 600)
         log_stats = kwargs.pop("log_stats", False)
+        log_stat_filepath = kwargs.get("log_stat_filepath")
         async_chunk = kwargs.pop("async_chunk", False)
         output_modalities = kwargs.pop("output_modalities", None)
         diffusion_batch_size: int = kwargs.pop("diffusion_batch_size", 1)
 
         if "log_requests" in kwargs:
             raise TypeError("`log_requests` has been removed in Omni/AsyncOmni. Use `log_stats`.")
+        if not log_stats and log_stat_filepath is not None:
+            logger.info(
+                "[%s] log_stat_filepath was provided without log_stats; enabling stats logging.",
+                self.__class__.__name__,
+            )
+            log_stats = True
         model = omni_snapshot_download(model)
         self.model = model
         self.log_stats = log_stats

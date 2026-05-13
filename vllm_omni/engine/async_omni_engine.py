@@ -226,6 +226,12 @@ class AsyncOmniEngine:
             ea_dict.pop("model", None)
             kwargs = {**ea_dict, **kwargs}
 
+        self.log_stats = bool(kwargs.get("log_stats", False))
+        self.log_stat_filepath = kwargs.get("log_stat_filepath")
+        if self.log_stat_filepath is not None:
+            logger.info(f"[AsyncOmniEngine] Engine metrics logging enabled (log_stats=True) with filepath: {self.log_stat_filepath}")
+            self.log_stats = True  # log_stat_filepath implies log_stats
+
         self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
 
         self.num_stages = len(self.stage_configs)
@@ -338,7 +344,7 @@ class AsyncOmniEngine:
                     launch_cm = launch_core_engines(
                         vllm_config=vllm_config,
                         executor_class=executor_class,
-                        log_stats=False,
+                        log_stats=self.log_stats,
                         addresses=addresses,
                     )
                     engine_manager, coordinator, addresses = launch_cm.__enter__()
@@ -407,7 +413,7 @@ class AsyncOmniEngine:
                 )
             output_processor = MultimodalOutputProcessor(
                 tokenizer=tokenizer,
-                log_stats=False,
+                log_stats=self.log_stats,
                 engine_core_output_type=started.metadata.engine_output_type,
             )
             input_processor = None
@@ -616,6 +622,8 @@ class AsyncOmniEngine:
                 stage_clients=self.stage_clients,
                 output_processors=self.output_processors,
                 stage_vllm_configs=self.stage_vllm_configs,
+                log_stats=self.log_stats,
+                log_stat_filepath=self.log_stat_filepath,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())

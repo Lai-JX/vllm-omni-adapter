@@ -1,9 +1,21 @@
 """Batch sweep: 256 samples (22 unique clips cycled), per-batch-group rows."""
-import json, sys, time, numpy as np, subprocess, os
+import asyncio, json, re, sys, time, numpy as np, subprocess, os
 import urllib.request as urllib_request
 from urllib.error import HTTPError
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+try:
+    import aiohttp
+    print(f"Using aiohttp {aiohttp.__version__} for async HTTP")
+except ImportError:
+    aiohttp = None
+
+try:
+    import httpx
+    if aiohttp is None:
+        print(f"Using httpx {httpx.__version__} for async HTTP")
+except ImportError:
+    httpx = None
 
 OMNI = Path(__file__).resolve().parents[1]
 for p in [str(OMNI), str(OMNI.parent/"alpamayo1.5"/"src"), str(OMNI.parent/"verl-liming"/"my_example"/"alpamayo"/"src")]:
@@ -14,19 +26,34 @@ from profiler.run_rollout_timing import (
     _adapt_messages_with_frames, _to_jsonable,
 )
 
-WORKSPACE_ROOT = OMNI.parents[1]
-DEFAULT_MODEL_PATH = WORKSPACE_ROOT / "model" / "Alpamayo-1.5-10B"
+DEFAULT_MODEL_PATH = "/share/models/Alpamayo-1.5-10B"
 MODEL    = os.environ.get("MODEL_PATH", str(DEFAULT_MODEL_PATH))
 HOST, PORT = "127.0.0.1", 8300
-N_UNIQUE = 22
-N_TOTAL  = 256
-BS_LIST  = [1, 2, 4, 8, 12, 16, 24]
+N_UNIQUE = 64 # 22
+N_TOTAL  = 64 # 256
+# BS_LIST  = [1, 2, 4, 8, 12, 16, 24]
+BS_LIST  = [1, 2, 4, 8]
 MAX_REQ_PER_GROUP = 24  # Request-side cap for each vLLM processing group
 CHUNK_SAMPLES = 16  # max samples per chunk
-OUT      = OMNI / "profiler" / "batch_sweep_results_new.md"
 SVC_YAML = OMNI / "profiler" / "alpamayo1_5_gpu0.yaml"
 
-def _restart_service(bs_val):
+LOG_DIR = OMNI / "profiler" / "logs" / str(N_TOTAL) / f"async_omni_{int(time.time())}"
+ASYNC_OMNI_LOG_DIR = LOG_DIR / "svc_logs"
+OUT = LOG_DIR / "metrics" / "batch_results.md"
+
+KV_TIMING_RE = re.compile(
+    r"KV transfer timing: req=(?P<req>\S+) "
+    r"extract_only_ms=(?P<extract_only_ms>\d+(?:\.\d+)?) "
+    r"transfer_only_ms=(?P<transfer_only_ms>\d+(?:\.\d+)?) "
+    r"extract_plus_transfer_ms=(?P<extract_plus_transfer_ms>\d+(?:\.\d+)?)"
+)
+RID_SUFFIX_RE = re.compile(r"(bs\d+-\S+)$")
+
+
+def _output_prefix(default_path: Path) -> Path:
+    return default_path.with_suffix("")
+
+def _restart_service(bs_val, log_stat=True):
     """Kill old vllm-omni service and start fresh for a given batch size."""
     import subprocess, os
     print(f"  Restarting service for BATCH={bs_val}...")
@@ -40,9 +67,14 @@ def _restart_service(bs_val):
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
     })
+    output_prefix = _output_prefix(OUT)
+    log_stat_filepath = output_prefix.with_name(f"{output_prefix.name}_engine_metrics_bs_{bs_val}")
+    log_stat_arg = f" --log-stat-filepath {str(log_stat_filepath)}" if log_stat else ""
+    print(log_stat_arg)
     cmd = (f"vllm-omni serve {MODEL} --omni --host 127.0.0.1 --port {PORT} "
-           f"--served-model-name alpamayo1.5 --stage-configs-path {SVC_YAML}")
-    log = OMNI / "profiler" / "logs" / f"svc_bs{bs_val}.log"
+           f"--served-model-name alpamayo1.5 --stage-configs-path {SVC_YAML}"
+           f"{log_stat_arg}")
+    log = ASYNC_OMNI_LOG_DIR / f"svc_bs{bs_val}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
     with open(log, "w") as f:
         subprocess.Popen(cmd, shell=True, env=env, stdout=f, stderr=f,
@@ -61,67 +93,126 @@ def _restart_service(bs_val):
 
 def _post(url, payload, timeout=60):
     """Short-timeout HTTP POST (skip rather than hang 300s)."""
+    t_encode_start = time.perf_counter()
     data = json.dumps(_to_jsonable(payload)).encode("utf-8")
+    encode_ms = (time.perf_counter() - t_encode_start) * 1000.0
     req = urllib_request.Request(url, data=data,
         headers={"Content-Type": "application/json"}, method="POST")
     try:
+        t_http_start = time.perf_counter()
         with urllib_request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            raw = resp.read()
+        http_ms = (time.perf_counter() - t_http_start) * 1000.0
+        t_decode_start = time.perf_counter()
+        parsed = json.loads(raw.decode("utf-8"))
+        decode_ms = (time.perf_counter() - t_decode_start) * 1000.0
+        return parsed, {
+            "client_encode_ms": encode_ms,
+            "client_http_ms": http_ms,
+            "client_decode_ms": decode_ms,
+        }
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {exc.code} when POST {url}\n{body[:300]}") from exc
 
 
-def one(cid, msg, ai, idx, bs):
-    """Send one request; return per-request metrics dict. Skip on timeout."""
-    rid = f"bs{bs}-{cid[:8]}-{idx}"
-    st = time.time()
-    try:
-        resp = _post(f"http://{HOST}:{PORT}/v1/chat/completions", {
-            "request_id": rid, "messages": msg, "add_generation_prompt": False,
-            "continue_final_message": True, "additional_information": ai,
-            "temperature": 0.6, "top_p": 0.98, "top_k": 40, "max_tokens": 256,
-            "stop_token_ids": None, "seed": 0, "return_custom_output": True})
-        lat = (time.time()-st)*1e3
-        m = resp.get("metrics", {}) or {}
-        co = m.get("custom_output", {}) or {}
-        inf = float(m.get("inference_only_ms", 0) or 0)
-        llm_ms = float(m.get("stage0_llm_ms", 0) or 0)
-        kv_tran_s0 = float(co.get("kv_tran_s0_ms", 0) or 0)
-        kv_tran_s1_receive = float(co.get("kv_tran_s1_receive_ms", 0) or 0)
-        df = float(co.get("df_ms", 0) or 0)
-        s0  = llm_ms + kv_tran_s0
-        s1  = kv_tran_s1_receive + df
-        return {"ok": True, "c": cid, "rid": rid, "lat": lat, "inf": inf,
-                "s0": s0, "s1": s1, "qw": max(0., inf-s0-s1), "net": lat-inf,
-            "kv": kv_tran_s1_receive,
-            "kv_tran_s0": kv_tran_s0,
-            "kv_tran_s1_receive": kv_tran_s1_receive,
-                "kv_tran_s1_prep": float(co.get("kv_tran_s1_prep_ms", 0) or 0),
-            "df": df,
-                "it": int(m.get("input_tokens", 0) or 0),
-                "ot": len(co.get("cot_token_ids", []))}
-    except Exception as e:
-        err_str = repr(e)[:200]
-        print(f"  ERR rid={rid} {err_str}")
-        return {"ok": False, "c": cid, "rid": rid,
-                "lat": (time.time()-st)*1e3, "err": err_str}
+async def _post_async(url, payload, timeout=60):
+    """Async HTTP POST with graceful fallback."""
+    t_encode_start = time.perf_counter()
+    body = json.dumps(_to_jsonable(payload)).encode("utf-8")
+    encode_ms = (time.perf_counter() - t_encode_start) * 1000.0
+    headers = {"Content-Type": "application/json"}
+
+    if httpx is not None:
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                t_http_start = time.perf_counter()
+                resp = await client.post(url, content=body, headers=headers)
+                http_ms = (time.perf_counter() - t_http_start) * 1000.0
+                resp.raise_for_status()
+                t_decode_start = time.perf_counter()
+                parsed = json.loads(resp.content.decode("utf-8"))
+                decode_ms = (time.perf_counter() - t_decode_start) * 1000.0
+                return parsed, {
+                    "client_encode_ms": encode_ms,
+                    "client_http_ms": http_ms,
+                    "client_decode_ms": decode_ms,
+                }
+        except httpx.HTTPStatusError as exc:
+            body = exc.response.text
+            raise RuntimeError(f"HTTP {exc.response.status_code} when POST {url}\n{body[:300]}") from exc
+
+    if aiohttp is not None:
+        timeout_cfg = aiohttp.ClientTimeout(total=timeout)
+        async with aiohttp.ClientSession(timeout=timeout_cfg) as session:
+            t_http_start = time.perf_counter()
+            async with session.post(url, data=body, headers=headers) as resp:
+                raw = await resp.read()
+            http_ms = (time.perf_counter() - t_http_start) * 1000.0
+            if resp.status >= 400:
+                raise RuntimeError(f"HTTP {resp.status} when POST {url}\n{raw.decode('utf-8', errors='replace')[:300]}")
+            t_decode_start = time.perf_counter()
+            parsed = json.loads(raw.decode("utf-8"))
+            decode_ms = (time.perf_counter() - t_decode_start) * 1000.0
+            return parsed, {
+                "client_encode_ms": encode_ms,
+                "client_http_ms": http_ms,
+                "client_decode_ms": decode_ms,
+            }
+
+    return await asyncio.to_thread(_post, url, payload, timeout)
 
 
-def run_group(grp, gi, bs):
-    """Run one batch group; return (wall_ms, per_req_list, group_agg)."""
-    workers = min(len(grp), 8 if bs <= 8 else 4)
-    t0 = time.time()
-    with ThreadPoolExecutor(max_workers=workers) as p:
-        fs = [p.submit(one, cid, msg, ai, gi*bs+ii, bs)
-              for ii, (cid, msg, ai) in enumerate(grp)]
-        results = [f.result() for f in as_completed(fs)]
-    wall_ms = (time.time()-t0)*1e3
+def _load_kv_metrics_from_log(bs):
+    """Load all stage-0 KV timing metrics for one batch size from service log."""
+    log_path = ASYNC_OMNI_LOG_DIR / f"svc_bs{bs}.log"
+    if not log_path.exists():
+        return {}
+
+    kv_metrics_by_rid = {}
+    for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = KV_TIMING_RE.search(line)
+        if not match:
+            continue
+        logged_req = match.group("req")
+        rid_match = RID_SUFFIX_RE.search(logged_req)
+        req_key = rid_match.group(1) if rid_match else logged_req
+        kv_metrics_by_rid[req_key] = {
+            "extract_only_ms": float(match.group("extract_only_ms")),
+            "transfer_only_ms": float(match.group("transfer_only_ms")),
+            "extract_plus_transfer_ms": float(match.group("extract_plus_transfer_ms")),
+        }
+    return kv_metrics_by_rid
+
+
+def _build_group_agg(results, wall_ms):
+    """Build aggregate stats for one group from per-request results."""
     ok_results = [r for r in results if r.get("ok")]
     n_ok = len(ok_results)
     agg = {"wall_ms": wall_ms, "ok": n_ok}
+    metric_keys = [
+        "inf", "s0", "s1",
+        "kv_tran_s0", "kv_tran_s0_total_ms", "kv_tran_s1_receive", "kv_tran_s1_prep",
+        "stage0_extract_only_ms", "stage0_transfer_only_ms", "stage0_extract_plus_transfer_ms",
+        "df", "qw", "net", "it", "ot",
+        "client_encode_ms", "client_http_ms", "client_decode_ms", "client_codec_ms",
+        "openai_handler_total_ms", "openai_pre_full_generator_ms", "openai_result_wait_ms",
+        "openai_postprocess_ms", "openai_response_build_ms", "openai_response_logging_ms",
+        "openai_check_model_ms", "openai_prepare_runtime_ms", "openai_preprocess_chat_ms",
+        "openai_image_prompt_rewrite_ms", "openai_schedule_generator_ms",
+        "openai_preprocess_merge_kwargs_ms", "openai_preprocess_build_params_ms",
+        "openai_preprocess_audio_injection_ms", "openai_preprocess_render_chat_ms",
+        "openai_preprocess_get_tokenizer_ms", "openai_preprocess_tool_adjust_ms",
+        "openai_preprocess_image_cleanup_ms", "openai_preprocess_finalize_prompt_ms",
+        "api_server_pre_route_ms", "api_server_handler_call_ms",
+        "api_server_request_body_ms", "api_server_request_json_ms",
+        "api_server_pre_route_other_ms", "api_server_request_body_bytes",
+        "api_server_endpoint_setup_ms", "api_server_post_handler_ms",
+        "api_server_response_dump_ms", "api_server_response_render_ms",
+        "api_server_route_total_ms",
+    ]
     if n_ok:
-        for k in ["inf","s0","s1","kv_tran_s0","kv_tran_s1_receive","kv_tran_s1_prep","df","qw","net","it","ot"]:
+        for k in metric_keys:
             vals = [r[k] for r in ok_results]
             agg[f"avg_{k}"] = np.mean(vals)
             agg[f"min_{k}"] = np.min(vals)
@@ -130,10 +221,179 @@ def run_group(grp, gi, bs):
         agg["bs_ot"] = sum(r["ot"] for r in ok_results)
         agg["bs_at"] = agg["bs_it"] + agg["bs_ot"]
     else:
-        for k in ["inf","s0","s1","kv_tran_s0","kv_tran_s1_receive","kv_tran_s1_prep","df","qw","net","it","ot"]:
+        for k in metric_keys:
             agg[f"avg_{k}"] = agg[f"min_{k}"] = agg[f"max_{k}"] = 0.0
         agg["bs_it"] = agg["bs_ot"] = agg["bs_at"] = 0
-    return wall_ms, results, agg
+    return agg
+
+
+def _backfill_kv_metrics_from_log(bs, bs_data):
+    """Backfill per-request KV timing metrics by reading the service log once."""
+    kv_metrics_by_rid = _load_kv_metrics_from_log(bs)
+    for grp in bs_data:
+        for req in grp.get("reqs", []):
+            if not req.get("ok"):
+                continue
+            log_metrics = kv_metrics_by_rid.get(req["rid"])
+            if log_metrics:
+                req["stage0_extract_only_ms"] = log_metrics["extract_only_ms"]
+                req["stage0_transfer_only_ms"] = log_metrics["transfer_only_ms"]
+                req["stage0_extract_plus_transfer_ms"] = log_metrics["extract_plus_transfer_ms"]
+                req["kv_tran_s0_total_ms"] = log_metrics["extract_plus_transfer_ms"]
+            req["s0"] = req["stage0_llm_ms"] # + req["kv_tran_s0_total_ms"]
+            # print(req["inf"], req["s0"], req["s1"], req["inf"] - req["s0"] - req["s1"])
+            req["qw"] = max(0.0, req["inf"] - req["s0"] - req["s1"])
+        grp["agg"] = _build_group_agg(grp.get("reqs", []), grp["agg"]["wall_ms"])
+
+
+def _build_result_from_response(resp, cid, rid, lat, client_timings=None):
+    """Convert response payload into profiler metrics dict."""
+    client_timings = client_timings or {}
+    m = resp.get("metrics", {}) or {}
+    co = m.get("custom_output", {}) or {}
+    inf = float(m.get("inference_only_ms", 0) or 0)
+    llm_ms = float(m.get("stage0_llm_ms", 0) or 0)
+    kv_tran_s0 = float(co.get("kv_tran_s0_ms", 0) or 0) # 只包含stage-0 extract kv的时间
+    kv_tran_s0_total_ms = kv_tran_s0
+    kv_tran_s1_receive = float(co.get("kv_tran_s1_receive_ms", 0) or 0)
+    df = float(co.get("df_ms", 0) or 0)
+    client_encode_ms = float(client_timings.get("client_encode_ms", 0.0) or 0.0)
+    client_http_ms = float(client_timings.get("client_http_ms", 0.0) or 0.0)
+    client_decode_ms = float(client_timings.get("client_decode_ms", 0.0) or 0.0)
+    openai_handler_total_ms = float(m.get("openai_handler_total_ms", 0.0) or 0.0)
+    openai_pre_full_generator_ms = float(m.get("openai_pre_full_generator_ms", 0.0) or 0.0)
+    openai_result_wait_ms = float(m.get("openai_result_wait_ms", 0.0) or 0.0)
+    openai_postprocess_ms = float(m.get("openai_postprocess_ms", 0.0) or 0.0)
+    openai_response_build_ms = float(m.get("openai_response_build_ms", 0.0) or 0.0)
+    openai_response_logging_ms = float(m.get("openai_response_logging_ms", 0.0) or 0.0)
+    openai_check_model_ms = float(m.get("openai_check_model_ms", 0.0) or 0.0)
+    openai_prepare_runtime_ms = float(m.get("openai_prepare_runtime_ms", 0.0) or 0.0)
+    openai_preprocess_chat_ms = float(m.get("openai_preprocess_chat_ms", 0.0) or 0.0)
+    openai_image_prompt_rewrite_ms = float(m.get("openai_image_prompt_rewrite_ms", 0.0) or 0.0)
+    openai_schedule_generator_ms = float(m.get("openai_schedule_generator_ms", 0.0) or 0.0)
+    openai_preprocess_merge_kwargs_ms = float(m.get("openai_preprocess_merge_kwargs_ms", 0.0) or 0.0)
+    openai_preprocess_build_params_ms = float(m.get("openai_preprocess_build_params_ms", 0.0) or 0.0)
+    openai_preprocess_audio_injection_ms = float(m.get("openai_preprocess_audio_injection_ms", 0.0) or 0.0)
+    openai_preprocess_render_chat_ms = float(m.get("openai_preprocess_render_chat_ms", 0.0) or 0.0)
+    openai_preprocess_get_tokenizer_ms = float(m.get("openai_preprocess_get_tokenizer_ms", 0.0) or 0.0)
+    openai_preprocess_tool_adjust_ms = float(m.get("openai_preprocess_tool_adjust_ms", 0.0) or 0.0)
+    openai_preprocess_image_cleanup_ms = float(m.get("openai_preprocess_image_cleanup_ms", 0.0) or 0.0)
+    openai_preprocess_finalize_prompt_ms = float(m.get("openai_preprocess_finalize_prompt_ms", 0.0) or 0.0)
+    api_server_pre_route_ms = float(m.get("api_server_pre_route_ms", 0.0) or 0.0)
+    api_server_request_body_ms = float(m.get("api_server_request_body_ms", 0.0) or 0.0)
+    api_server_request_json_ms = float(m.get("api_server_request_json_ms", 0.0) or 0.0)
+    api_server_pre_route_other_ms = float(m.get("api_server_pre_route_other_ms", 0.0) or 0.0)
+    api_server_request_body_bytes = float(m.get("api_server_request_body_bytes", 0.0) or 0.0)
+    api_server_endpoint_setup_ms = float(m.get("api_server_endpoint_setup_ms", 0.0) or 0.0)
+    api_server_handler_call_ms = float(m.get("api_server_handler_call_ms", 0.0) or 0.0)
+    api_server_post_handler_ms = float(m.get("api_server_post_handler_ms", 0.0) or 0.0)
+    api_server_response_dump_ms = float(m.get("api_server_response_dump_ms", 0.0) or 0.0)
+    api_server_response_render_ms = float(m.get("api_server_response_render_ms", 0.0) or 0.0)
+    api_server_route_total_ms = float(m.get("api_server_route_total_ms", 0.0) or 0.0)
+    s0  = llm_ms + kv_tran_s0_total_ms
+    s1  = kv_tran_s1_receive + df
+    return {"ok": True, "c": cid, "rid": rid, "lat": lat, "inf": inf,
+            "stage0_llm_ms": llm_ms,
+            "s0": s0, "s1": s1, "qw": max(0., inf-s0-s1), "net": lat-inf,
+        "client_encode_ms": client_encode_ms,
+        "client_http_ms": client_http_ms,
+        "client_decode_ms": client_decode_ms,
+        "client_codec_ms": client_encode_ms + client_decode_ms,
+        "openai_handler_total_ms": openai_handler_total_ms,
+        "openai_pre_full_generator_ms": openai_pre_full_generator_ms,
+        "openai_result_wait_ms": openai_result_wait_ms,
+        "openai_postprocess_ms": openai_postprocess_ms,
+        "openai_response_build_ms": openai_response_build_ms,
+        "openai_response_logging_ms": openai_response_logging_ms,
+        "openai_check_model_ms": openai_check_model_ms,
+        "openai_prepare_runtime_ms": openai_prepare_runtime_ms,
+        "openai_preprocess_chat_ms": openai_preprocess_chat_ms,
+        "openai_image_prompt_rewrite_ms": openai_image_prompt_rewrite_ms,
+        "openai_schedule_generator_ms": openai_schedule_generator_ms,
+        "openai_preprocess_merge_kwargs_ms": openai_preprocess_merge_kwargs_ms,
+        "openai_preprocess_build_params_ms": openai_preprocess_build_params_ms,
+        "openai_preprocess_audio_injection_ms": openai_preprocess_audio_injection_ms,
+        "openai_preprocess_render_chat_ms": openai_preprocess_render_chat_ms,
+        "openai_preprocess_get_tokenizer_ms": openai_preprocess_get_tokenizer_ms,
+        "openai_preprocess_tool_adjust_ms": openai_preprocess_tool_adjust_ms,
+        "openai_preprocess_image_cleanup_ms": openai_preprocess_image_cleanup_ms,
+        "openai_preprocess_finalize_prompt_ms": openai_preprocess_finalize_prompt_ms,
+        "api_server_pre_route_ms": api_server_pre_route_ms,
+        "api_server_request_body_ms": api_server_request_body_ms,
+        "api_server_request_json_ms": api_server_request_json_ms,
+        "api_server_pre_route_other_ms": api_server_pre_route_other_ms,
+        "api_server_request_body_bytes": api_server_request_body_bytes,
+        "api_server_endpoint_setup_ms": api_server_endpoint_setup_ms,
+        "api_server_handler_call_ms": api_server_handler_call_ms,
+        "api_server_post_handler_ms": api_server_post_handler_ms,
+        "api_server_response_dump_ms": api_server_response_dump_ms,
+        "api_server_response_render_ms": api_server_response_render_ms,
+        "api_server_route_total_ms": api_server_route_total_ms,
+        "kv": kv_tran_s1_receive,
+        "stage0_extract_only_ms": kv_tran_s0,
+        "stage0_transfer_only_ms": 0.0,
+        "stage0_extract_plus_transfer_ms": kv_tran_s0_total_ms,
+        "kv_tran_s0_total_ms": kv_tran_s0_total_ms,
+        "kv_tran_s0": kv_tran_s0,
+        "kv_tran_s1_receive": kv_tran_s1_receive,
+            "kv_tran_s1_prep": float(co.get("kv_tran_s1_prep_ms", 0) or 0),
+        "df": df,
+            "it": int(m.get("input_tokens", 0) or 0),
+            "ot": len(co.get("cot_token_ids", []))}
+
+
+
+def one(cid, msg, ai, idx, bs):
+    """Send one request; return per-request metrics dict. Skip on timeout."""
+    rid = f"bs{bs}-{cid[:8]}-{idx}"
+    st = time.time()
+    try:
+        resp, client_timings = _post(f"http://{HOST}:{PORT}/v1/chat/completions", {
+            "request_id": rid, "messages": msg, "add_generation_prompt": False,
+            "continue_final_message": True, "additional_information": ai,
+            "temperature": 0.6, "top_p": 0.98, "top_k": 40, "max_tokens": 256,
+            "stop_token_ids": None, "seed": 0, "return_custom_output": True})
+        lat = (time.time()-st)*1e3
+        return _build_result_from_response(resp, cid, rid, lat, client_timings)
+    except Exception as e:
+        err_str = repr(e)[:200]
+        print(f"  ERR rid={rid} {err_str}")
+        return {"ok": False, "c": cid, "rid": rid,
+                "lat": (time.time()-st)*1e3, "err": err_str}
+
+
+async def one_async(cid, msg, ai, idx, bs, sem):
+    """Send one request asynchronously; return per-request metrics dict."""
+    rid = f"bs{bs}-{cid[:8]}-{idx}"
+    st = time.time()
+    async with sem:
+        try:
+            resp, client_timings = await _post_async(f"http://{HOST}:{PORT}/v1/chat/completions", {
+                "request_id": rid, "messages": msg, "add_generation_prompt": False,
+                "continue_final_message": True, "additional_information": ai,
+                "temperature": 0.6, "top_p": 0.98, "top_k": 40, "max_tokens": 256,
+                "stop_token_ids": None, "seed": 0, "return_custom_output": True})
+            lat = (time.time()-st)*1e3
+            return _build_result_from_response(resp, cid, rid, lat, client_timings)
+        except Exception as e:
+            err_str = repr(e)[:200]
+            print(f"  ERR rid={rid} {err_str}")
+            return {"ok": False, "c": cid, "rid": rid,
+                    "lat": (time.time()-st)*1e3, "err": err_str}
+
+
+async def run_group_async(grp, gi, bs):
+    """Run one batch group; return (wall_ms, per_req_list, group_agg)."""
+    workers = min(len(grp), 8 if bs <= 8 else 4)
+    sem = asyncio.Semaphore(workers)
+    t0 = time.time()
+    tasks = [
+        asyncio.create_task(one_async(cid, msg, ai, gi * bs + ii, bs, sem))
+        for ii, (cid, msg, ai) in enumerate(grp)
+    ]
+    results = await asyncio.gather(*tasks)
+    wall_ms = (time.time()-t0)*1e3
+    return wall_ms, results, _build_group_agg(results, wall_ms)
 
 def gen(all_batches, clip_stats):
     """3 tables: per-request detail, per-group stats, per-BS throughput."""
@@ -169,6 +429,38 @@ def gen(all_batches, clip_stats):
 
     metric_names = [
         ("lat_ms", "lat"), ("net_ms", "net"), ("inf_ms", "inf"),
+        ("client_encode_ms", "client_encode_ms"), ("client_http_ms", "client_http_ms"),
+        ("client_decode_ms", "client_decode_ms"), ("client_codec_ms", "client_codec_ms"),
+        ("openai_handler_total_ms", "openai_handler_total_ms"),
+        ("openai_pre_full_generator_ms", "openai_pre_full_generator_ms"),
+        ("openai_check_model_ms", "openai_check_model_ms"),
+        ("openai_prepare_runtime_ms", "openai_prepare_runtime_ms"),
+        ("openai_preprocess_chat_ms", "openai_preprocess_chat_ms"),
+        ("openai_preprocess_merge_kwargs_ms", "openai_preprocess_merge_kwargs_ms"),
+        ("openai_preprocess_build_params_ms", "openai_preprocess_build_params_ms"),
+        ("openai_preprocess_audio_injection_ms", "openai_preprocess_audio_injection_ms"),
+        ("openai_preprocess_render_chat_ms", "openai_preprocess_render_chat_ms"),
+        ("openai_preprocess_get_tokenizer_ms", "openai_preprocess_get_tokenizer_ms"),
+        ("openai_preprocess_tool_adjust_ms", "openai_preprocess_tool_adjust_ms"),
+        ("openai_preprocess_image_cleanup_ms", "openai_preprocess_image_cleanup_ms"),
+        ("openai_preprocess_finalize_prompt_ms", "openai_preprocess_finalize_prompt_ms"),
+        ("api_server_pre_route_ms", "api_server_pre_route_ms"),
+        ("api_server_request_body_ms", "api_server_request_body_ms"),
+        ("api_server_request_json_ms", "api_server_request_json_ms"),
+        ("api_server_pre_route_other_ms", "api_server_pre_route_other_ms"),
+        ("api_server_request_body_bytes", "api_server_request_body_bytes"),
+        ("api_server_endpoint_setup_ms", "api_server_endpoint_setup_ms"),
+        ("api_server_handler_call_ms", "api_server_handler_call_ms"),
+        ("api_server_post_handler_ms", "api_server_post_handler_ms"),
+        ("api_server_response_dump_ms", "api_server_response_dump_ms"),
+        ("api_server_response_render_ms", "api_server_response_render_ms"),
+        ("api_server_route_total_ms", "api_server_route_total_ms"),
+        ("openai_image_prompt_rewrite_ms", "openai_image_prompt_rewrite_ms"),
+        ("openai_schedule_generator_ms", "openai_schedule_generator_ms"),
+        ("openai_result_wait_ms", "openai_result_wait_ms"),
+        ("openai_postprocess_ms", "openai_postprocess_ms"),
+        ("openai_response_build_ms", "openai_response_build_ms"),
+        ("openai_response_logging_ms", "openai_response_logging_ms"),
         ("qw_ms", "qw"), ("s0_ms", "s0"), ("s1_ms", "s1"),
         ("kv_tran_s0_ms", "kv_tran_s0"), ("kv_tran_s1_receive_ms", "kv_tran_s1_receive"),
         ("kv_tran_s1_prep_ms", "kv_tran_s1_prep"),
@@ -232,11 +524,12 @@ def gen(all_batches, clip_stats):
     OUT.write_text("\n".join(L))
     print(f"  -> {OUT}")
 
-def main():
+async def main_async():
     print(f"Batch sweep: {N_TOTAL} samples ({N_UNIQUE} unique clips cycled), BS={BS_LIST}")
     print("Loading dataset + preparing clips...")
     avdi = _load_local_avdi()
     ci = avdi.clip_index
+    print(len(list(ci[ci.chunk==3116].index)))
     unique_cids = list(ci[ci.chunk==3116].index)[:N_UNIQUE]
 
     clips_unique, disk_ms_list, prep_ms_list = [], [], []
@@ -284,7 +577,7 @@ def main():
                 grp = samples[start:end]
                 if len(grp) > MAX_REQ_PER_GROUP:
                     raise ValueError(f"Group size {len(grp)} exceeds cap {MAX_REQ_PER_GROUP}")
-                wm, results, agg = run_group(grp, gi, bs)
+                wm, results, agg = await run_group_async(grp, gi, bs)
                 bs_data.append({"gid": gi, "reqs": results, "agg": agg})
                 total_ok = sum(d["agg"]["ok"] for d in bs_data)
                 done_reqs += len(grp)
@@ -292,15 +585,28 @@ def main():
                       f"wall={wm:.0f}ms [cum ok={total_ok}/{done_reqs}]")
             if chunk_end < n_groups:
                 print(f"  chunk done, sleep 8s...")
-                time.sleep(8)
+                await asyncio.sleep(8)
 
+        _backfill_kv_metrics_from_log(bs, bs_data)
         all_batches[bs] = bs_data
         total_ok = sum(d["agg"]["ok"] for d in bs_data)
         total_wall = sum(d["agg"]["wall_ms"] for d in bs_data)
         print(f"  DONE ok={total_ok}/{N_TOTAL} E2E={total_wall/1e3:.1f}s")
+        output_prefix = _output_prefix(OUT)
+        bs_output_path = output_prefix.with_name(f"{output_prefix.name}_bs_{bs}.json")
+        bs_output_payload = _to_jsonable({"all_batches": all_batches, "cs": cs})
+        bs_output_path.write_text(
+            json.dumps(
+                bs_output_payload,
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
         gen(all_batches, cs)
 
     print(f"\nALL DONE => {OUT}")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main_async())

@@ -20,7 +20,8 @@ from typing import Annotated, Any, Literal, cast
 import httpx
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.routing import APIRoute
 from PIL import Image
 from pydantic import BaseModel, Field
 from starlette.datastructures import State
@@ -223,6 +224,46 @@ def _remove_route_from_router(
 ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL = "endpoint-load-metrics-format"
 
 
+class OmniTimingAPIRoute(APIRoute):
+    """Route wrapper that timestamps requests before FastAPI body parsing."""
+
+    def get_route_handler(self):
+        original_route_handler = super().get_route_handler()
+
+        async def timed_route_handler(request: Request):
+            request.state.omni_api_arrival_ts = time.perf_counter()
+            request.state.omni_request_body_ms = 0.0
+            request.state.omni_request_json_ms = 0.0
+            request.state.omni_request_body_bytes = 0
+
+            original_body = request.body
+            original_json = request.json
+
+            async def timed_body():
+                body_start_ts = time.perf_counter()
+                body = await original_body()
+                if not getattr(request.state, "omni_request_body_ms", 0.0):
+                    request.state.omni_request_body_ms = (time.perf_counter() - body_start_ts) * 1000.0
+                    request.state.omni_request_body_bytes = len(body)
+                return body
+
+            async def timed_json():
+                json_start_ts = time.perf_counter()
+                parsed = await original_json()
+                if not getattr(request.state, "omni_request_json_ms", 0.0):
+                    request.state.omni_request_json_ms = (time.perf_counter() - json_start_ts) * 1000.0
+                return parsed
+
+            request.body = timed_body
+            request.json = timed_json
+            return await original_route_handler(request)
+
+        return timed_route_handler
+
+
+router.route_class = OmniTimingAPIRoute
+
+
 async def _get_vllm_config(engine_client: EngineClient) -> Any:
     if hasattr(engine_client, "get_vllm_config"):
         return await engine_client.get_vllm_config()
@@ -348,6 +389,7 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
 
         # OMNI: Pass supported_tasks to build_app (required by upstream vLLM)
         app = build_openai_app(args, supported_tasks)
+
         # OMNI: Remove upstream routes that we override with omni-specific handlers
         _remove_route_from_app(app, "/v1/chat/completions", {"POST"})
         _remove_route_from_app(app, "/v1/models", {"GET"})  # Remove upstream /v1/models to use omni's handler
@@ -894,6 +936,8 @@ def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
 @with_cancellation
 @load_aware_call
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+    route_entry_ts = time.perf_counter()
+    api_arrival_ts = getattr(raw_request.state, "omni_api_arrival_ts", route_entry_ts)
     metrics_header_format = raw_request.headers.get(ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, "")
     handler = Omnichat(raw_request)
     if handler is None:
@@ -905,7 +949,9 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             )
         return base_server.create_error_response(message="The model does not support Chat Completions API")
     try:
+        handler_start_ts = time.perf_counter()
         generator = await handler.create_chat_completion(request, raw_request)
+        handler_done_ts = time.perf_counter()
     except Exception as e:
         logger.exception("Chat completion failed: %s", e)
         raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
@@ -917,10 +963,51 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         )
 
     elif isinstance(generator, ChatCompletionResponse):
+        request_body_ms = float(getattr(raw_request.state, "omni_request_body_ms", 0.0) or 0.0)
+        request_json_ms = float(getattr(raw_request.state, "omni_request_json_ms", 0.0) or 0.0)
+        pre_route_ms = (route_entry_ts - api_arrival_ts) * 1000.0
+        base_api_metrics = {
+            "api_server_pre_route_ms": pre_route_ms,
+            "api_server_request_body_ms": request_body_ms,
+            "api_server_request_json_ms": request_json_ms,
+            "api_server_pre_route_other_ms": max(0.0, pre_route_ms - request_body_ms - request_json_ms),
+            "api_server_request_body_bytes": int(getattr(raw_request.state, "omni_request_body_bytes", 0) or 0),
+            "api_server_endpoint_setup_ms": (handler_start_ts - route_entry_ts) * 1000.0,
+            "api_server_handler_call_ms": (handler_done_ts - handler_start_ts) * 1000.0,
+            "api_server_post_handler_ms": 0.0,
+            "api_server_response_dump_ms": 0.0,
+            "api_server_response_render_ms": 0.0,
+            "api_server_route_total_ms": 0.0,
+        }
+        if generator.metrics is None:
+            generator.metrics = {}
+        generator.metrics.update(base_api_metrics)
         # Completely bypass Pydantic serialization warnings for multimodal content
         # by converting to dict first, then serializing with warnings suppressed
         import json as json_lib
         import warnings as warnings_module
+
+        def _build_json_response(response_dict: dict[str, Any], dump_start_ts: float, dump_done_ts: float) -> Response:
+            response_metrics = response_dict.setdefault("metrics", {})
+            response_metrics.update(base_api_metrics)
+            response_metrics["api_server_response_dump_ms"] = (dump_done_ts - dump_start_ts) * 1000.0
+
+            # Render once to measure serialization cost, then re-render with the
+            # measured metrics included in the final response body.
+            render_start_ts = time.perf_counter()
+            json_lib.dumps(response_dict, ensure_ascii=False, separators=(",", ":"))
+            render_done_ts = time.perf_counter()
+
+            response_metrics["api_server_response_render_ms"] = (render_done_ts - render_start_ts) * 1000.0
+            response_metrics["api_server_post_handler_ms"] = (render_done_ts - handler_done_ts) * 1000.0
+            response_metrics["api_server_route_total_ms"] = (render_done_ts - api_arrival_ts) * 1000.0
+
+            body = json_lib.dumps(response_dict, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            return Response(
+                content=body,
+                media_type="application/json",
+                headers=metrics_header(metrics_header_format),
+            )
 
         # Temporarily suppress ALL Pydantic UserWarnings during serialization
         with warnings_module.catch_warnings():
@@ -928,28 +1015,26 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
             warnings_module.filterwarnings("ignore", message=".*Pydantic.*", category=UserWarning)
             try:
                 # Use serialize_as_any=True to bypass type checking
+                dump_start_ts = time.perf_counter()
                 response_dict = generator.model_dump(mode="json", serialize_as_any=True, warnings="none")
-                return JSONResponse(
-                    content=response_dict,
-                    headers=metrics_header(metrics_header_format),
-                )
+                dump_done_ts = time.perf_counter()
+                return _build_json_response(response_dict, dump_start_ts, dump_done_ts)
             except Exception:
                 # Fallback: convert to JSON string and parse back to avoid any serialization issues
                 try:
+                    dump_start_ts = time.perf_counter()
                     response_json = generator.model_dump_json(warnings="none", serialize_as_any=True)
                     response_dict = json_lib.loads(response_json)
-                    return JSONResponse(
-                        content=response_dict,
-                        headers=metrics_header(metrics_header_format),
-                    )
+                    dump_done_ts = time.perf_counter()
+                    return _build_json_response(response_dict, dump_start_ts, dump_done_ts)
                 except Exception:
                     # Last resort: regular dump with warnings suppressed
                     with warnings_module.catch_warnings():
                         warnings_module.filterwarnings("ignore", category=UserWarning)
-                        return JSONResponse(
-                            content=generator.model_dump(mode="json", warnings="none"),
-                            headers=metrics_header(metrics_header_format),
-                        )
+                        dump_start_ts = time.perf_counter()
+                        response_dict = generator.model_dump(mode="json", warnings="none")
+                        dump_done_ts = time.perf_counter()
+                        return _build_json_response(response_dict, dump_start_ts, dump_done_ts)
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
 

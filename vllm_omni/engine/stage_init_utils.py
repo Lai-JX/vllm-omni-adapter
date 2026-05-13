@@ -500,7 +500,11 @@ def close_started_llm_stage(started: StartedLlmStage) -> None:
         if resource is None:
             continue
         try:
-            resource.close()
+            shutdown = getattr(resource, "shutdown", None)
+            if callable(shutdown):
+                shutdown()
+            else:
+                resource.close()
         except Exception as cleanup_error:
             logger.warning(
                 "[stage_init] Failed to close launched %s for stage %s: %s",

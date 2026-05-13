@@ -149,11 +149,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         For diffusion models, this generates images and returns them
         in a chat completion response format.
         """
+        request_entry_ts = time.perf_counter()
+        pre_fg_metrics: dict[str, float] = {}
         # Handle diffusion mode
         if self._diffusion_mode:
             return await self._create_diffusion_chat_completion(request, raw_request)
 
+        t_check_model_start = time.perf_counter()
         error_check_ret = await self._check_model(request)
+        pre_fg_metrics["openai_check_model_ms"] = (time.perf_counter() - t_check_model_start) * 1000.0
         if error_check_ret is not None:
             logger.error("Error with model %s", error_check_ret)
             return error_check_ret
@@ -165,6 +169,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             raise self.engine_client.dead_error
 
         try:
+            t_runtime_prepare_start = time.perf_counter()
             lora_request = self._maybe_get_adapters(request, supports_default_mm_loras=True)
 
             model_name = self.models.model_name(lora_request)
@@ -221,8 +226,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tool_dicts = None
             else:
                 tool_dicts = [tool.model_dump() for tool in request.tools]
+            pre_fg_metrics["openai_prepare_runtime_ms"] = (time.perf_counter() - t_runtime_prepare_start) * 1000.0
 
             if not self.use_harmony:
+                t_preprocess_chat_start = time.perf_counter()
                 error_check_ret = self._validate_chat_template(
                     request_chat_template=request.chat_template,
                     chat_template_kwargs=request.chat_template_kwargs,
@@ -253,12 +260,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     continue_final_message=request.continue_final_message,
                     documents=getattr(request, "documents", None),
                     add_special_tokens=request.add_special_tokens,
+                    timing_metrics=pre_fg_metrics,
                 )
+                pre_fg_metrics["openai_preprocess_chat_ms"] = (time.perf_counter() - t_preprocess_chat_start) * 1000.0
             else:
+                t_preprocess_chat_start = time.perf_counter()
                 should_include_tools = tool_dicts is not None
                 conversation, engine_prompts = self.openai_serving_render._make_request_with_harmony(
                     request, should_include_tools
                 )
+                pre_fg_metrics["openai_preprocess_chat_ms"] = (time.perf_counter() - t_preprocess_chat_start) * 1000.0
 
         except (ValueError, TypeError, RuntimeError, jinja2.TemplateError) as e:
             logger.exception("Error in preprocessing prompt inputs")
@@ -280,6 +291,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # processor can construct the correct inputs.
         # If we pass pre-tokenized chat-template ids, GLM-Image can become
         # effectively unconditioned and produce nonsense images.
+        t_image_prompt_rewrite_start = time.perf_counter()
         if request.modalities and ("image" in request.modalities):
             try:
                 messages_as_dicts: list[dict[str, Any]] = []
@@ -360,10 +372,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         else:
             _image_gen_height = None
             _image_gen_width = None
+        pre_fg_metrics["openai_image_prompt_rewrite_ms"] = (
+            time.perf_counter() - t_image_prompt_rewrite_start
+        ) * 1000.0
 
         # Schedule the request and get the result generator.
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
+            t_schedule_generator_start = time.perf_counter()
             for i, engine_prompt in enumerate(engine_prompts):
                 if hasattr(request, "sampling_params_list"):
                     sampling_params_list = self._to_sampling_params_list(request.sampling_params_list)
@@ -395,6 +411,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 )
 
                 generators.append(generator)
+            pre_fg_metrics["openai_schedule_generator_ms"] = (time.perf_counter() - t_schedule_generator_start) * 1000.0
         except ValueError as e:
             return self.create_error_response(e)
 
@@ -424,6 +441,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tokenizer,
                 request_metadata,
                 reasoning_parser,
+                request_entry_ts=request_entry_ts,
+                pre_fg_metrics=pre_fg_metrics,
             )
         except ValueError as e:
             return self.create_error_response(e)
@@ -443,12 +462,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         continue_final_message: bool = False,
         documents: list[dict[str, str]] | None = None,
         add_special_tokens: bool = False,
+        timing_metrics: dict[str, float] | None = None,
     ) -> tuple[list[ConversationMessage], list[TokPrompt]]:
+        if timing_metrics is None:
+            timing_metrics = {}
+
         if renderer is None:
             renderer = self.renderer
 
         # Keep OMNI compatibility args wired while delegating rendering
         # to the upstream async renderer pipeline.
+        t_merge_kwargs_start = time.perf_counter()
         default_template_kwargs = merge_kwargs(
             default_template_kwargs,
             dict(
@@ -460,12 +484,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 tokenize=isinstance(renderer.tokenizer, MistralTokenizer),
             ),
         )
+        timing_metrics["openai_preprocess_merge_kwargs_ms"] = (time.perf_counter() - t_merge_kwargs_start) * 1000.0
 
+        t_build_params_start = time.perf_counter()
         tok_params = request.build_tok_params(self.model_config)
         chat_params = request.build_chat_params(
             default_template,
             default_template_content_format,
         ).with_defaults(default_template_kwargs)
+        timing_metrics["openai_preprocess_build_params_ms"] = (time.perf_counter() - t_build_params_start) * 1000.0
 
         # OMNI: When use_audio_in_video=True, the qwen2_5_omni_thinker mm
         # processor asserts that audio items are present alongside video items
@@ -473,9 +500,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # messages BEFORE calling render_chat_async so the mm processor can
         # count them correctly during tokenisation.
         mm_proc_kw = getattr(request, "mm_processor_kwargs", None) or {}
+        t_audio_injection_start = time.perf_counter()
         if mm_proc_kw.get("use_audio_in_video", False):
             messages = await self._inject_audio_from_video_urls(messages)
+        timing_metrics["openai_preprocess_audio_injection_ms"] = (
+            time.perf_counter() - t_audio_injection_start
+        ) * 1000.0
 
+        t_render_chat_start = time.perf_counter()
         (conversation,), (engine_prompt,) = await renderer.render_chat_async(
             [messages],
             chat_params,
@@ -484,8 +516,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 k: v for k in ("mm_processor_kwargs", "cache_salt") if (v := getattr(request, k, None)) is not None
             },
         )
+        timing_metrics["openai_preprocess_render_chat_ms"] = (time.perf_counter() - t_render_chat_start) * 1000.0
 
+        t_get_tokenizer_start = time.perf_counter()
         tokenizer = renderer.get_tokenizer()
+        timing_metrics["openai_preprocess_get_tokenizer_ms"] = (time.perf_counter() - t_get_tokenizer_start) * 1000.0
 
         # tool parsing is done only if a tool_parser has been set and if
         # tool_choice is not "none" (if tool_choice is "none" but a tool_parser
@@ -494,6 +529,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             hasattr(request, "tool_choice") and request.tool_choice != "none"
         )
 
+        t_tool_adjust_start = time.perf_counter()
         if should_parse_tools:
             if not isinstance(request, ChatCompletionRequest):
                 msg = "Tool usage is only supported for Chat Completions API"
@@ -502,11 +538,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             request = tool_parser(tokenizer).adjust_request(  # type: ignore
                 request=request
             )
+        timing_metrics["openai_preprocess_tool_adjust_ms"] = (time.perf_counter() - t_tool_adjust_start) * 1000.0
 
         # Preserve a clean text prompt for downstream stages (e.g., GLM-Image diffusion).
         # For image generation, we want the raw user caption instead of a rendered template.
         # But for multimodal comprehension (img2text), we MUST keep the rendered prompt
         # containing image tokens.
+        t_image_cleanup_start = time.perf_counter()
         req_modalities = getattr(request, "modalities", [])
         if req_modalities and ("image" in req_modalities):
             messages_as_dicts: list[dict[str, Any]] = []
@@ -525,7 +563,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             extracted_prompt, _ = self._extract_diffusion_prompt_and_images(messages_as_dicts)
             if extracted_prompt:
                 engine_prompt["prompt"] = extracted_prompt
+        timing_metrics["openai_preprocess_image_cleanup_ms"] = (
+            time.perf_counter() - t_image_cleanup_start
+        ) * 1000.0
 
+        t_engine_prompt_finalize_start = time.perf_counter()
         mm_processor_kwargs = getattr(request, "mm_processor_kwargs", None)
         if mm_processor_kwargs is not None:
             engine_prompt["mm_processor_kwargs"] = mm_processor_kwargs
@@ -544,6 +586,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             if "additional_information" not in engine_prompt or engine_prompt["additional_information"] is None:
                 engine_prompt["additional_information"] = {}
             engine_prompt["additional_information"]["language"] = [language.strip()]
+        timing_metrics["openai_preprocess_finalize_prompt_ms"] = (
+            time.perf_counter() - t_engine_prompt_finalize_start
+        ) * 1000.0
 
         return conversation, [engine_prompt]
 
@@ -1489,9 +1534,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         reasoning_parser: ReasoningParser | None = None,
+        request_entry_ts: float | None = None,
+        pre_fg_metrics: dict[str, float] | None = None,
     ) -> ErrorResponse | OmniChatCompletionResponse:
         created_time = int(time.time())
         _arrival_ts = time.perf_counter()
+        if request_entry_ts is None:
+            request_entry_ts = _arrival_ts
+        if pre_fg_metrics is None:
+            pre_fg_metrics = {}
         final_res: RequestOutput | None = None
 
         final_outputs: list[OmniRequestOutput] = []
@@ -1504,6 +1555,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             return self.create_error_response(e)
 
         assert final_outputs is not None
+        _result_stream_done_ts = time.perf_counter()
 
         choices: list[ChatCompletionResponseChoice] = []
 
@@ -1555,11 +1607,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 response_metrics = omni_outputs.metrics
             choices.extend(choices_data)
 
-        _server_total_ms = (time.perf_counter() - _arrival_ts) * 1000.0
+        _response_build_start_ts = time.perf_counter()
         if response_metrics is None:
             response_metrics = {}
+
+        _response_preview_ts = time.perf_counter()
+        _server_total_ms = (_response_preview_ts - _arrival_ts) * 1000.0
         response_metrics["server_total_ms"] = _server_total_ms
         response_metrics["inference_only_ms"] = _server_total_ms
+        response_metrics["openai_handler_total_ms"] = (_response_preview_ts - request_entry_ts) * 1000.0
+        response_metrics["openai_pre_full_generator_ms"] = (_arrival_ts - request_entry_ts) * 1000.0
+        response_metrics.update(pre_fg_metrics)
+        response_metrics["openai_result_wait_ms"] = (_result_stream_done_ts - _arrival_ts) * 1000.0
+        response_metrics["openai_postprocess_ms"] = (_response_build_start_ts - _result_stream_done_ts) * 1000.0
+        response_metrics["openai_response_build_ms"] = (_response_preview_ts - _response_build_start_ts) * 1000.0
+        response_metrics["openai_response_logging_ms"] = 0.0
 
         response = OmniChatCompletionResponse(
             id=request_id,
@@ -1572,6 +1634,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             kv_transfer_params=kv_transfer_params,
             metrics=response_metrics,
         )
+        _response_built_ts = time.perf_counter()
 
         # Log complete response if output logging is enabled
         if self.enable_log_outputs and self.request_logger:
@@ -1602,6 +1665,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         is_streaming=False,
                         delta=False,
                     )
+
+        logging_ms = (time.perf_counter() - _response_built_ts) * 1000.0
+        response_metrics["openai_response_logging_ms"] = logging_ms
+        if response.metrics is not None:
+            response.metrics["openai_response_logging_ms"] = logging_ms
 
         return response
 
@@ -2398,6 +2466,7 @@ class OmniStructuredOutputOpenAIServingChat(OmniOpenAIServingChat):
         continue_final_message: bool = False,
         documents: list[dict[str, str]] | None = None,
         add_special_tokens: bool = False,
+        timing_metrics: dict[str, float] | None = None,
     ) -> tuple[list[ConversationMessage], list[TokPrompt]]:
         conversation, engine_prompts = await super()._preprocess_chat(
             request=request,
@@ -2412,6 +2481,7 @@ class OmniStructuredOutputOpenAIServingChat(OmniOpenAIServingChat):
             continue_final_message=continue_final_message,
             documents=documents,
             add_special_tokens=add_special_tokens,
+            timing_metrics=timing_metrics,
         )
 
         engine_prompt = engine_prompts[0]
@@ -2441,9 +2511,15 @@ class OmniStructuredOutputOpenAIServingChat(OmniOpenAIServingChat):
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
         reasoning_parser: ReasoningParser | None = None,
+        request_entry_ts: float | None = None,
+        pre_fg_metrics: dict[str, float] | None = None,
     ) -> ErrorResponse | OmniChatCompletionResponse:
         created_time = int(time.time())
         _arrival_ts = time.perf_counter()
+        if request_entry_ts is None:
+            request_entry_ts = _arrival_ts
+        if pre_fg_metrics is None:
+            pre_fg_metrics = {}
         final_outputs: list[OmniRequestOutput] = []
         try:
             async for res in result_generator:
@@ -2453,6 +2529,7 @@ class OmniStructuredOutputOpenAIServingChat(OmniOpenAIServingChat):
         except ValueError as e:
             return self.create_error_response(e)
 
+        _result_stream_done_ts = time.perf_counter()
         choices: list[ChatCompletionResponseChoice] = []
         usage = UsageInfo(prompt_tokens=0, completion_tokens=0, total_tokens=0)
         role = self.get_chat_request_role(request)
@@ -2512,11 +2589,21 @@ class OmniStructuredOutputOpenAIServingChat(OmniOpenAIServingChat):
                 response_metrics["custom_output"] = self._to_jsonable(omni_outputs.custom_output)
             choices.extend(choices_data)
 
-        _server_total_ms = (time.perf_counter() - _arrival_ts) * 1000.0
+        _response_build_start_ts = time.perf_counter()
         if response_metrics is None:
             response_metrics = {}
+
+        _response_preview_ts = time.perf_counter()
+        _server_total_ms = (_response_preview_ts - _arrival_ts) * 1000.0
         response_metrics["server_total_ms"] = _server_total_ms
         response_metrics["inference_only_ms"] = _server_total_ms
+        response_metrics["openai_handler_total_ms"] = (_response_preview_ts - request_entry_ts) * 1000.0
+        response_metrics["openai_pre_full_generator_ms"] = (_arrival_ts - request_entry_ts) * 1000.0
+        response_metrics.update(pre_fg_metrics)
+        response_metrics["openai_result_wait_ms"] = (_result_stream_done_ts - _arrival_ts) * 1000.0
+        response_metrics["openai_postprocess_ms"] = (_response_build_start_ts - _result_stream_done_ts) * 1000.0
+        response_metrics["openai_response_build_ms"] = (_response_preview_ts - _response_build_start_ts) * 1000.0
+        response_metrics["openai_response_logging_ms"] = 0.0
 
         response = OmniChatCompletionResponse(
             id=request_id,
@@ -2529,6 +2616,7 @@ class OmniStructuredOutputOpenAIServingChat(OmniOpenAIServingChat):
             kv_transfer_params=kv_transfer_params,
             metrics=response_metrics,
         )
+        _response_built_ts = time.perf_counter()
 
         if self.enable_log_outputs and self.request_logger:
             for choice in choices:
@@ -2552,6 +2640,11 @@ class OmniStructuredOutputOpenAIServingChat(OmniOpenAIServingChat):
                         is_streaming=False,
                         delta=False,
                     )
+
+        logging_ms = (time.perf_counter() - _response_built_ts) * 1000.0
+        response_metrics["openai_response_logging_ms"] = logging_ms
+        if response.metrics is not None:
+            response.metrics["openai_response_logging_ms"] = logging_ms
 
         return response
 

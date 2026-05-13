@@ -39,7 +39,8 @@ import torch
 # === Path setup ===
 OMNI_ROOT = Path(__file__).resolve().parents[1]
 ALPAMAYO_SRC = OMNI_ROOT.parent / "alpamayo1.5" / "src"
-VERL_SRC = OMNI_ROOT.parent / "verl-liming" / "my_example" / "alpamayo" / "src"
+# VERL_SRC = OMNI_ROOT.parent / "verl-liming" / "my_example" / "alpamayo" / "src"
+VERL_SRC = OMNI_ROOT.parent / "verl" / "my_example" / "alpamayo" / "src"
 WORKSPACE_ROOT = OMNI_ROOT.parents[2]
 
 for p in (str(OMNI_ROOT), str(ALPAMAYO_SRC), str(VERL_SRC)):

@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import csv
 import time as _time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import janus
@@ -22,6 +24,7 @@ from vllm.outputs import RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.metrics.stats import IterationStats, SchedulerStats
 
 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
 from vllm_omni.engine import (
@@ -33,6 +36,105 @@ from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
 
 logger = init_logger(__name__)
+
+
+class OmniStatCSVLogger:
+    """Lightweight CSV logger for omni stage-level scheduler/iteration stats."""
+
+    def __init__(self, filepath: str):
+        self.filepath = Path(filepath)
+        if self.filepath.suffix != ".csv":
+            self.filepath = self.filepath.with_suffix(".csv")
+        self.filepath.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.filepath.open("w", encoding="utf-8", newline="")
+        self._csv = csv.writer(self._file)
+        self._csv.writerow(
+            [
+                "stage_id",
+                "timestamp",
+                "engine_core_timestamp",
+                "num_running_requests",
+                "num_waiting_requests",
+                "kv_cache_usage",
+                "encoder_cache_usage",
+                "prefix_cache_queries",
+                "prefix_cache_hits",
+                "num_generation_tokens",
+                "num_prompt_tokens",
+                "num_preempted_requests",
+                "num_finished_requests",
+                "time_to_first_token_avg",
+                "time_per_output_token_avg",
+                "e2e_latency_avg",
+                "engine_step_num_seqs",
+                "engine_step_per_seq_lens",
+                "engine_step_inference_latency_ms",
+            ]
+        )
+        self._file.flush()
+
+    def close(self) -> None:
+        try:
+            self._file.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _avg(values: list[float]) -> float:
+        return (sum(values) / len(values)) if values else 0.0
+
+    def log(
+        self,
+        *,
+        stage_id: int,
+        engine_core_timestamp: float | None,
+        scheduler_stats: SchedulerStats | None,
+        iteration_stats: IterationStats | None,
+        engine_step_msg: Any | None = None,
+    ) -> None:
+        if scheduler_stats is None and iteration_stats is None:
+            return
+        finished_requests = (
+            iteration_stats.finished_requests if iteration_stats is not None else []
+        )
+        step_num_seqs = ""
+        step_per_seq_lens = ""
+        step_inference_latency_ms = ""
+        if engine_step_msg is not None:
+            step_num_seqs = getattr(engine_step_msg, "num_seqs", "")
+            per_seq_lens = getattr(engine_step_msg, "per_seq_lens", None)
+            if per_seq_lens is not None:
+                try:
+                    step_per_seq_lens = ",".join(str(v) for v in per_seq_lens)
+                except Exception:
+                    step_per_seq_lens = str(per_seq_lens)
+            step_inference_latency_ms = getattr(
+                engine_step_msg, "inference_latency_ms", ""
+            )
+        self._csv.writerow(
+            [
+                stage_id,
+                _time.time(),
+                engine_core_timestamp or 0.0,
+                getattr(scheduler_stats, "num_running_reqs", 0),
+                getattr(scheduler_stats, "num_waiting_reqs", 0),
+                getattr(scheduler_stats, "kv_cache_usage", 0.0),
+                getattr(scheduler_stats, "encoder_cache_usage", 0.0),
+                getattr(getattr(scheduler_stats, "prefix_cache_stats", None), "queries", 0),
+                getattr(getattr(scheduler_stats, "prefix_cache_stats", None), "hits", 0),
+                getattr(iteration_stats, "num_generation_tokens", 0),
+                getattr(iteration_stats, "num_prompt_tokens", 0),
+                getattr(iteration_stats, "num_preempted_reqs", 0),
+                len(finished_requests),
+                self._avg(list(getattr(iteration_stats, "time_to_first_tokens_iter", []) or [])),
+                self._avg([fr.mean_time_per_output_token for fr in finished_requests]),
+                self._avg([fr.e2e_latency for fr in finished_requests]),
+                step_num_seqs,
+                step_per_seq_lens,
+                step_inference_latency_ms,
+            ]
+        )
+        self._file.flush()
 
 
 def build_engine_core_request_from_tokens(
@@ -126,6 +228,8 @@ class Orchestrator:
         stage_vllm_configs: list[Any],
         *,
         async_chunk: bool = False,
+        log_stats: bool = False,
+        log_stat_filepath: str | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -133,6 +237,8 @@ class Orchestrator:
 
         self.num_stages = len(stage_clients)
         self.async_chunk = bool(async_chunk)
+        self.log_stats = bool(log_stats)
+        self.log_stat_filepath = log_stat_filepath
 
         self.stage_clients: list[Any] = stage_clients
         self.output_processors: list[Any] = output_processors
@@ -156,6 +262,7 @@ class Orchestrator:
         # Shutdown coordination
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
+        self._stat_logger = OmniStatCSVLogger(log_stat_filepath) if (self.log_stats and log_stat_filepath) else None
 
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
@@ -195,6 +302,8 @@ class Orchestrator:
                 t.cancel()
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
+            if self._stat_logger is not None:
+                self._stat_logger.close()
 
     async def _request_handler(self) -> None:
         """Read messages from the main thread via request_async_queue."""
@@ -570,11 +679,12 @@ class Orchestrator:
         Also handles abort forwarding and scheduler stats updates.
         """
         processor = self.output_processors[stage_id]
+        iteration_stats = IterationStats() if self.log_stats else None
 
         processed = processor.process_outputs(
             raw_outputs.outputs,
             raw_outputs.timestamp,
-            None,
+            iteration_stats,
         )
 
         if processed.reqs_to_abort:
@@ -582,6 +692,15 @@ class Orchestrator:
 
         if raw_outputs.scheduler_stats is not None:
             processor.update_scheduler_stats(raw_outputs.scheduler_stats)
+
+        if self._stat_logger is not None:
+            self._stat_logger.log(
+                stage_id=stage_id,
+                engine_core_timestamp=raw_outputs.timestamp,
+                scheduler_stats=raw_outputs.scheduler_stats,
+                iteration_stats=iteration_stats,
+                engine_step_msg=getattr(raw_outputs, "engine_step_msg", None),
+            )
 
         return processed.request_outputs
 

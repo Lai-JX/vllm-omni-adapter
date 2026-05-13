@@ -16,7 +16,7 @@ from alpamayo1_5 import helper
 from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
 from alpamayo1_5.models.alpamayo1_5 import ExpertLogitsProcessor
 from alpamayo1_5.models.token_utils import StopAfterEOS, replace_padding_after_eos, to_special_token
-import tests.diffusion.models.alpamoya.custom_test.offline.common as ct
+import common as ct
 from vllm_omni.debug.compare_request_state_dump import compare_dump_files
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
@@ -767,12 +767,17 @@ async def run_omni(
             raise RuntimeError("no final output")
 
         custom = final_output.custom_output
-        cot_token_ids = custom["cot_token_ids"].detach().cpu()
+        cot_token_ids = custom["cot_token_ids"]
+        if hasattr(cot_token_ids, "detach"):
+            cot_token_ids = cot_token_ids.detach().cpu()
         result = {
             "pred_xyz": custom["pred_xyz"].detach().cpu(),
             "pred_rot": custom["pred_rot"].detach().cpu(),
             "cot_token_ids": cot_token_ids,
-            "cot_text_raw": tokenizer.decode(cot_token_ids[0, 0].tolist(), skip_special_tokens=False),
+            "cot_text_raw": tokenizer.decode(
+                _first_token_id_sequence(cot_token_ids),
+                skip_special_tokens=False,
+            ),
             "stage0_context_used": custom.get("stage0_context_used"),
         }
         result["cot_text"] = extract_cot_body(result["cot_text_raw"])
@@ -825,12 +830,17 @@ async def run_omni_stage1_only(
             request_id=REQUEST_ID,
         )
         custom = result.custom_output
-        cot_token_ids = custom["cot_token_ids"].detach().cpu()
+        cot_token_ids = custom["cot_token_ids"]
+        if hasattr(cot_token_ids, "detach"):
+            cot_token_ids = cot_token_ids.detach().cpu()
         output = {
             "pred_xyz": custom["pred_xyz"].detach().cpu(),
             "pred_rot": custom["pred_rot"].detach().cpu(),
             "cot_token_ids": cot_token_ids,
-            "cot_text_raw": tokenizer.decode(cot_token_ids[0, 0].tolist(), skip_special_tokens=False),
+            "cot_text_raw": tokenizer.decode(
+                _first_token_id_sequence(cot_token_ids),
+                skip_special_tokens=False,
+            ),
             "stage0_context_used": custom.get("stage0_context_used"),
             "mode": "stage1_only",
         }
@@ -858,6 +868,17 @@ def print_dump_compare_report(title: str, lhs_path: Path, rhs_path: Path, keys: 
     print(f"Differences found: {len(diffs)}")
     for diff in diffs:
         print("-", diff)
+
+
+def _first_token_id_sequence(token_ids: object) -> list[int]:
+    current = token_ids
+    while isinstance(current, list) and current and isinstance(current[0], list):
+        current = current[0]
+    if hasattr(current, "tolist"):
+        current = current.tolist()
+    if isinstance(current, list):
+        return current
+    raise TypeError(f"Unsupported cot_token_ids payload type: {type(token_ids)!r}")
 
 
 async def main():

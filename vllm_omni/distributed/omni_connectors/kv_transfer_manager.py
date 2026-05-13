@@ -210,13 +210,22 @@ class OmniKVTransferManager:
                 )
                 if kv_data:
                     # Record s0-side KV transfer time in metadata
-                    kv_data.metadata["kv_tran_s0_ms"] = (time.time() - t0) * 1000.0
+                    t_extract_done = time.time()
+                    kv_data.metadata["kv_tran_s0_ms"] = (t_extract_done - t0) * 1000.0
 
                     # Resolve global request ID if available
                     transfer_req_id = request_id_resolver(req_id) if request_id_resolver else req_id
 
                     # Transfer to downstream stage via connector
                     self._transfer_kv_cache(kv_data, transfer_req_id)
+                    t_transfer_done = time.time()
+                    logger.info(
+                        "KV transfer timing: req=%s extract_only_ms=%.3f transfer_only_ms=%.3f extract_plus_transfer_ms=%.3f",
+                        transfer_req_id,
+                        (t_extract_done - t0) * 1000.0,
+                        (t_transfer_done - t_extract_done) * 1000.0,
+                        (t_transfer_done - t0) * 1000.0,
+                    )
 
             except Exception as e:
                 logger.error(f"Failed KV transfer for {req_id}: {e}")
