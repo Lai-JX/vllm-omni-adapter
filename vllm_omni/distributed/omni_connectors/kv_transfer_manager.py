@@ -212,6 +212,7 @@ class OmniKVTransferManager:
                     # Record s0-side KV transfer time in metadata
                     t_extract_done = time.time()
                     kv_data.metadata["kv_tran_s0_ms"] = (t_extract_done - t0) * 1000.0
+                    kv_data.metadata["kv_tran_s0_start_time"] = t0
 
                     # Resolve global request ID if available
                     transfer_req_id = request_id_resolver(req_id) if request_id_resolver else req_id
@@ -220,12 +221,14 @@ class OmniKVTransferManager:
                     self._transfer_kv_cache(kv_data, transfer_req_id)
                     t_transfer_done = time.time()
                     logger.info(
-                        "KV transfer timing: req=%s extract_only_ms=%.3f transfer_only_ms=%.3f extract_plus_transfer_ms=%.3f",
+                        "[Metrics] Send KV transfer timing: req=%s extract_only_ms=%.3f transfer_only_ms=%.3f extract_plus_transfer_ms=%.3f",
                         transfer_req_id,
                         (t_extract_done - t0) * 1000.0,
                         (t_transfer_done - t_extract_done) * 1000.0,
                         (t_transfer_done - t0) * 1000.0,
                     )
+                    logger.info(f"[Metrics] KV Send req {transfer_req_id} time_ms={(t_transfer_done-t0)*1000.0:.2f} start={t0:.3f} now={t_transfer_done:.3f}")
+
 
             except Exception as e:
                 logger.error(f"Failed KV transfer for {req_id}: {e}")
@@ -378,7 +381,7 @@ class OmniKVTransferManager:
         self,
         request_id: str,
         target_device: torch.device | None = None,
-    ) -> tuple[dict[str, Any] | None, int]:
+    ) -> tuple[dict[str, Any] | None, int, dict[str, Any] | None]:
         """Receive KV cache for a specific request.
 
         This implements the receiving logic from gpu_diffusion_model_runner.py.
@@ -388,21 +391,21 @@ class OmniKVTransferManager:
             target_device: Optional device to move tensors to
 
         Returns:
-            Tuple of (data dict, size) if successful, (None, 0) otherwise
+            Tuple of (data dict, size, metadata) if successful, (None, 0, None) otherwise
         """
         if not self.connector:
             logger.warning("No connector available for receiving KV cache")
-            return None, 0
+            return None, 0, None
 
         from_stage, to_stage = self.recv_stages
         if not from_stage or not to_stage:
             logger.warning("Receive stages not configured")
-            return None, 0
+            return None, 0, None
 
         # Check if we should receive KV cache based on config
         if not self.config.need_recv_cache:
             logger.info(f"Skip receiving KV cache for {request_id} (need_recv_cache=False)")
-            return None, 0
+            return None, 0, None
 
         timeout = self.config.recv_timeout
         start_time = time.time()
@@ -413,6 +416,7 @@ class OmniKVTransferManager:
             while True:
                 # Build the full key for connector
                 full_request_id = f"omni_{from_stage}_to_{to_stage}_kv_cache_{request_id}"
+                kv_receive_start = time.time()
                 result = self.connector.get(
                     from_stage=from_stage,
                     to_stage=to_stage,
@@ -432,21 +436,28 @@ class OmniKVTransferManager:
                             for i, tensor in enumerate(cache_list):
                                 if isinstance(tensor, torch.Tensor) and tensor.device != target_device:
                                     cache_list[i] = tensor.to(target_device).contiguous()
-
-                    return data, size
+                    now = time.time()
+                    kv_receive_time = now - kv_receive_start
+                    logger.info(f"[Metrics] KV Receive req {request_id} time_ms={kv_receive_time*1000.0:.2f} start={kv_receive_start:.3f} now={now:.3f}")
+                    kv_revceive_msg = {
+                        "kv_receive_time_ms": kv_receive_time * 1000.0,
+                        "kv_receive_start": kv_receive_start,
+                        "kv_receive_end": now,
+                    }
+                    return data, size, kv_revceive_msg
 
                 if time.time() - start_time > timeout:
                     logger.error(f"Timeout waiting for KV cache for request {request_id} after {timeout}s")
-                    return None, 0
+                    return None, 0, None
 
-                time.sleep(0.5)
+                time.sleep(0.02)
 
         except Exception as e:
             logger.error(f"Error receiving KV cache for {request_id}: {e}")
             import traceback
 
             traceback.print_exc()
-            return None, 0
+            return None, 0, None
 
     def apply_kv_cache_to_request(self, req: Any, data: dict[str, Any]) -> None:
         """Apply received KV cache data to a request object.
@@ -473,7 +484,7 @@ class OmniKVTransferManager:
                 req.sampling_params.kv_metadata = data["metadata"]
 
     # Legacy compatibility method
-    def receive_kv_cache(self, req: Any, target_device: torch.device | None = None) -> bool:
+    def receive_kv_cache(self, req: Any, target_device: torch.device | None = None) -> tuple[bool, dict[str, Any] | None]:
         """Receive KV cache and populate request object (legacy interface).
 
         Args:
@@ -490,13 +501,13 @@ class OmniKVTransferManager:
 
         if not request_id:
             logger.warning("Request has no ID, cannot receive KV cache")
-            return False
+            return False, None
 
-        data, size = self.receive_kv_cache_for_request(request_id, target_device)
+        data, size, kv_receive_msg = self.receive_kv_cache_for_request(request_id, target_device)
         if data:
             self.apply_kv_cache_to_request(req, data)
-            return True
-        return False
+            return True, kv_receive_msg
+        return False, None
 
     def receive_multi_kv_cache(
         self,
@@ -523,7 +534,7 @@ class OmniKVTransferManager:
             True if primary KV cache was received successfully.
         """
         t0 = time.perf_counter()
-        primary_ok = self.receive_kv_cache(req, target_device)
+        primary_ok, kv_receive_msg = self.receive_kv_cache(req, target_device)
 
         cfg_ids = getattr(getattr(req, "sampling_params", None), "cfg_kv_request_ids", None)
         if cfg_ids and cfg_kv_collect_func:
@@ -547,7 +558,9 @@ class OmniKVTransferManager:
         kv_receive_ms = (time.perf_counter() - t0) * 1000.0
         if hasattr(req, "sampling_params") and req.sampling_params is not None:
             req.sampling_params._kv_receive_ms = kv_receive_ms
-
+            if kv_receive_msg:
+                for k, v in kv_receive_msg.items():
+                    setattr(req.sampling_params, k, v)
         return primary_ok
 
     def receive_multi_kv_cache_distributed(

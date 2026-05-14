@@ -88,13 +88,20 @@ bash tests/diffusion/models/alpamoya/custom_test/online/start_alpamoya_profile.s
 3. 发送一条请求：
 
 ```bash
-bash tests/diffusion/models/alpamoya/custom_test/online/request_alpamoya_service.sh
+bash tests/diffusion/models/alpamoya/custom_test/online/request_alpamoya_service.sh 
 ```
-
+<!-- d00c117c-e1bb-4e8d-b49c-ff7482dc2aa5 -->
 4. 停止 profiler：
 
 ```bash
 bash tests/diffusion/models/alpamoya/custom_test/online/stop_alpamoya_profile.sh
+```
+5. 完整命令
+```bash
+bash tests/diffusion/models/alpamoya/custom_test/online/request_alpamoya_service.sh;
+STAGES_JSON=all bash tests/diffusion/models/alpamoya/custom_test/online/start_alpamoya_profile.sh;
+bash tests/diffusion/models/alpamoya/custom_test/online/request_alpamoya_service.sh d00c117c-e1bb-4e8d-b49c-ff7482dc2aa5;
+STAGES_JSON=all bash tests/diffusion/models/alpamoya/custom_test/online/stop_alpamoya_profile.sh;
 ```
 
 如果想 profile 全部 stage：

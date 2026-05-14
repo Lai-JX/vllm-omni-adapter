@@ -50,8 +50,8 @@ stage_args:
       profiler_config:
         profiler: torch
         torch_profiler_dir: /workspace/project/RL-learning/vllm-omni/learning/test/torch_traces
-        torch_profiler_record_shapes: true
-        torch_profiler_with_memory: true
+        torch_profiler_record_shapes: false
+        torch_profiler_with_memory: false
         torch_profiler_with_stack: true
         torch_profiler_use_gzip: false
 
@@ -96,8 +96,8 @@ stage_args:
       profiler_config:
         profiler: torch
         torch_profiler_dir: /workspace/project/RL-learning/vllm-omni/learning/test/torch_traces
-        torch_profiler_record_shapes: true
-        torch_profiler_with_memory: true
+        torch_profiler_record_shapes: false
+        torch_profiler_with_memory: false
         torch_profiler_with_stack: true
         torch_profiler_use_gzip: false
 

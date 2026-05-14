@@ -257,6 +257,7 @@ class DiffusionModelRunner:
                     kv_meta = getattr(req, "kv_metadata", None) or {}
                     if isinstance(kv_meta, dict):
                         req.sampling_params._kv_tran_s0_ms = kv_meta.get("kv_tran_s0_ms", 0.0)
+                        req.sampling_params._kv_tran_s0_start_time = kv_meta.get("kv_tran_s0_start_time", None)
 
             if req.sampling_params.generator is None and req.sampling_params.seed is not None:
                 if req.sampling_params.generator_device is not None:

@@ -972,7 +972,10 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             kv_ms_list.append(float(kv_ms))
             diff_ms_list.append(float(diff_ms))
 
-        forward_total_ms = (_time.time() - t_forward_start) * 1000.0
+        now = _time.time()
+        forward_total_ms = (now - t_forward_start) * 1000.0
+        logger.info(f"[Metrics] Stage 1 diffusion req {req_id} time_ms={forward_total_ms:.2f} start={t_forward_start:.3f} now={now:.3f}")
+
         diffusion_ms = getattr(req.sampling_params, "_s1_diffusion_ms", forward_total_ms)
         kv_transfer_ms = getattr(req.sampling_params, "_kv_receive_ms", 0.0)
         custom_output: dict[str, Any] = {
@@ -980,8 +983,11 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             "pred_rot": pred_rot_list[0] if len(pred_rot_list) == 1 else pred_rot_list,
             "cot_token_ids": _flatten_cot(cot_ids_list[0] if len(cot_ids_list) == 1 else cot_ids_list),
             "stage0_context_used": getattr(req.sampling_params, "past_key_values", None) is not None,
+            "kv_tran_s0_start_time": getattr(req.sampling_params, "_kv_tran_s0_start_time", None),
             "kv_tran_s0_ms": getattr(req.sampling_params, "_kv_tran_s0_ms", 0.0),
             "kv_tran_s1_receive_ms": kv_transfer_ms,
+            "kv_tran_s1_actual_receive_ms": getattr(req.sampling_params, "kv_receive_time_ms", None),
+            "kv_tran_s1_reveive_end_time": getattr(req.sampling_params, "kv_receive_end", None),
             "kv_tran_s1_prep_ms": kv_ms_list[0] if len(kv_ms_list) == 1 else kv_ms_list,
             "df_ms": diffusion_ms,
             "stage1_forward_total_ms": forward_total_ms,

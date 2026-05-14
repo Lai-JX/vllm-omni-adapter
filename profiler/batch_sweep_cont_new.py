@@ -29,17 +29,21 @@ from profiler.run_rollout_timing import (
 DEFAULT_MODEL_PATH = "/share/models/Alpamayo-1.5-10B"
 MODEL    = os.environ.get("MODEL_PATH", str(DEFAULT_MODEL_PATH))
 HOST, PORT = "127.0.0.1", 8300
-N_UNIQUE = 64 # 22
-N_TOTAL  = 64 # 256
+N_UNIQUE = 1 # 22
+N_TOTAL  = 2 # 256
 # BS_LIST  = [1, 2, 4, 8, 12, 16, 24]
-BS_LIST  = [1, 2, 4, 8]
+BS_LIST  = [1]
 MAX_REQ_PER_GROUP = 24  # Request-side cap for each vLLM processing group
 CHUNK_SAMPLES = 16  # max samples per chunk
 SVC_YAML = OMNI / "profiler" / "alpamayo1_5_gpu0.yaml"
+PROFILE_GID_ENV = os.environ.get("PROFILE_GID", "").strip()
+PROFILE_STAGES_ENV = os.environ.get("PROFILE_STAGES", "0,1").strip()
 
-LOG_DIR = OMNI / "profiler" / "logs" / str(N_TOTAL) / f"async_omni_{int(time.time())}"
+LOG_DIR = OMNI / "profiler" / "logs" / str(N_TOTAL) / f"async_omni_trace-gid{PROFILE_GID_ENV}_{int(time.time())}"
 ASYNC_OMNI_LOG_DIR = LOG_DIR / "svc_logs"
 OUT = LOG_DIR / "metrics" / "batch_results.md"
+PROFILE_DIR = LOG_DIR / "torch_traces"
+RUNTIME_SVC_YAML = LOG_DIR / SVC_YAML.name
 
 KV_TIMING_RE = re.compile(
     r"KV transfer timing: req=(?P<req>\S+) "
@@ -52,6 +56,48 @@ RID_SUFFIX_RE = re.compile(r"(bs\d+-\S+)$")
 
 def _output_prefix(default_path: Path) -> Path:
     return default_path.with_suffix("")
+
+
+def _parse_profile_gid():
+    """Parse PROFILE_GID env into a 0-based group id to profile."""
+    if not PROFILE_GID_ENV:
+        return None
+    gids = set()
+    for gid in PROFILE_GID_ENV.split(","):
+        gid = gid.strip()
+        if not gid:
+            continue
+        if not gid.isdigit() or int(gid) < 0:
+            raise ValueError(f"Invalid PROFILE_GID value: {gid!r}")
+        gids.add(int(gid))
+    return gids
+
+
+def _build_runtime_stage_config(
+    source_stage_config_path: Path = SVC_YAML,
+    runtime_stage_config_path: Path = RUNTIME_SVC_YAML,
+    profile_dir: Path = PROFILE_DIR,
+) -> Path:
+    """Create a temporary stage config with torch_profiler_dir rewritten."""
+    profile_dir = Path(profile_dir)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    runtime_stage_config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    config_text = source_stage_config_path.read_text(encoding="utf-8")
+    updated_text, replacements = re.subn(
+        r"^(\s*torch_profiler_dir:\s*).*$",
+        rf"\1{profile_dir}",
+        config_text,
+        flags=re.MULTILINE,
+    )
+    if replacements == 0:
+        raise RuntimeError(f"No torch_profiler_dir entries found in {source_stage_config_path}")
+    runtime_stage_config_path.write_text(updated_text, encoding="utf-8")
+    print(
+        f"  Wrote runtime stage config {runtime_stage_config_path} "
+        f"(torch_profiler_dir -> {profile_dir})"
+    )
+    return runtime_stage_config_path
 
 def _restart_service(bs_val, log_stat=True):
     """Kill old vllm-omni service and start fresh for a given batch size."""
@@ -72,7 +118,7 @@ def _restart_service(bs_val, log_stat=True):
     log_stat_arg = f" --log-stat-filepath {str(log_stat_filepath)}" if log_stat else ""
     print(log_stat_arg)
     cmd = (f"vllm-omni serve {MODEL} --omni --host 127.0.0.1 --port {PORT} "
-           f"--served-model-name alpamayo1.5 --stage-configs-path {SVC_YAML}"
+           f"--served-model-name alpamayo1.5 --stage-configs-path {RUNTIME_SVC_YAML}"
            f"{log_stat_arg}")
     log = ASYNC_OMNI_LOG_DIR / f"svc_bs{bs_val}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -114,6 +160,35 @@ def _post(url, payload, timeout=60):
     except HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTP {exc.code} when POST {url}\n{body[:300]}") from exc
+
+
+def _parse_profile_stages():
+    """Parse PROFILE_STAGES env into request payload value."""
+    if not PROFILE_STAGES_ENV:
+        return None
+    stages = []
+    for raw_stage in PROFILE_STAGES_ENV.split(","):
+        stage = raw_stage.strip()
+        if not stage:
+            continue
+        stages.append(int(stage))
+    return stages or None
+
+
+def _profile_request_body():
+    stages = _parse_profile_stages()
+    return {} if stages is None else {"stages": stages}
+
+
+def _set_profiler_enabled(is_start: bool, timeout=60):
+    """Call the service profiler API directly from the batch sweep script."""
+    action = "start_profile" if is_start else "stop_profile"
+    resp, _ = _post(
+        f"http://{HOST}:{PORT}/{action}",
+        _profile_request_body(),
+        timeout=timeout,
+    )
+    return resp
 
 
 async def _post_async(url, payload, timeout=60):
@@ -192,7 +267,7 @@ def _build_group_agg(results, wall_ms):
     agg = {"wall_ms": wall_ms, "ok": n_ok}
     metric_keys = [
         "inf", "s0", "s1",
-        "kv_tran_s0", "kv_tran_s0_total_ms", "kv_tran_s1_receive", "kv_tran_s1_prep",
+        "kv_tran_total", "kv_tran_s0", "kv_tran_s0_total_ms", "kv_tran_s1_receive", "kv_tran_s1_actual_receive_ms", "kv_tran_s1_prep",
         "stage0_extract_only_ms", "stage0_transfer_only_ms", "stage0_extract_plus_transfer_ms",
         "df", "qw", "net", "it", "ot",
         "client_encode_ms", "client_http_ms", "client_decode_ms", "client_codec_ms",
@@ -253,9 +328,12 @@ def _build_result_from_response(resp, cid, rid, lat, client_timings=None):
     co = m.get("custom_output", {}) or {}
     inf = float(m.get("inference_only_ms", 0) or 0)
     llm_ms = float(m.get("stage0_llm_ms", 0) or 0)
+    kv_tran_s0_start_time = float(co.get("kv_tran_s0_start_time", 0) or 0)
+    kv_tran_s1_reveive_end_time = float(co.get("kv_tran_s1_reveive_end_time", 0) or 0)
     kv_tran_s0 = float(co.get("kv_tran_s0_ms", 0) or 0) # 只包含stage-0 extract kv的时间
     kv_tran_s0_total_ms = kv_tran_s0
     kv_tran_s1_receive = float(co.get("kv_tran_s1_receive_ms", 0) or 0)
+    kv_tran_s1_actual_receive_ms = float(co.get("kv_tran_s1_actual_receive_ms", 0) or 0)
     df = float(co.get("df_ms", 0) or 0)
     client_encode_ms = float(client_timings.get("client_encode_ms", 0.0) or 0.0)
     client_http_ms = float(client_timings.get("client_http_ms", 0.0) or 0.0)
@@ -330,16 +408,18 @@ def _build_result_from_response(resp, cid, rid, lat, client_timings=None):
         "api_server_response_render_ms": api_server_response_render_ms,
         "api_server_route_total_ms": api_server_route_total_ms,
         "kv": kv_tran_s1_receive,
+        "kv_tran_total": (kv_tran_s1_reveive_end_time-kv_tran_s0_start_time) * 1000 if kv_tran_s0_start_time and kv_tran_s1_reveive_end_time else 0.0,
         "stage0_extract_only_ms": kv_tran_s0,
         "stage0_transfer_only_ms": 0.0,
         "stage0_extract_plus_transfer_ms": kv_tran_s0_total_ms,
         "kv_tran_s0_total_ms": kv_tran_s0_total_ms,
         "kv_tran_s0": kv_tran_s0,
         "kv_tran_s1_receive": kv_tran_s1_receive,
-            "kv_tran_s1_prep": float(co.get("kv_tran_s1_prep_ms", 0) or 0),
+        "kv_tran_s1_actual_receive_ms": kv_tran_s1_actual_receive_ms,
+        "kv_tran_s1_prep": float(co.get("kv_tran_s1_prep_ms", 0) or 0),
         "df": df,
-            "it": int(m.get("input_tokens", 0) or 0),
-            "ot": len(co.get("cot_token_ids", []))}
+        "it": int(m.get("input_tokens", 0) or 0),
+        "ot": len(co.get("cot_token_ids", []))}
 
 
 
@@ -403,8 +483,8 @@ def gen(all_batches, clip_stats):
          "",
          "## 表1: 逐请求详细指标",
          "",
-         "| bs | gid | rid | lat_ms | net_ms | inf_ms | qw_ms | s0_ms | s1_ms | kv_ms | df_ms | itok | otok |",
-         "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+         "| bs | gid | rid | lat_ms | net_ms | inf_ms | qw_ms | s0_ms | s1_ms | kv_total_ms | kv_s0_total_ms | kv_ms | kv_s1_actual_receive_ms | df_ms | itok | otok |",
+         "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
 
     for bs in BS_LIST:
         for grp in all_batches.get(bs, []):
@@ -413,7 +493,7 @@ def gen(all_batches, clip_stats):
                     continue
                 L.append(f"| {bs} | {grp['gid']} | {req['rid']} | {req['lat']:.0f} | {req['net']:.0f}"
                          f" | {req['inf']:.0f} | {req['qw']:.0f} | {req['s0']:.0f} | {req['s1']:.0f}"
-                         f" | {req['kv']:.0f} | {req['df']:.0f} | {req['it']} | {req['ot']} |")
+                         f" | {req['kv_tran_total']:.0f} | {req['kv_tran_s0_total_ms']:.0f} | {req['kv']:.0f} | {req['kv_tran_s1_actual_receive_ms']:.0f} | {req['df']:.0f} | {req['it']} | {req['ot']} |")
 
     L += ["",
           "## 表2: 逐 BS 请求级指标统计",
@@ -462,7 +542,10 @@ def gen(all_batches, clip_stats):
         ("openai_response_build_ms", "openai_response_build_ms"),
         ("openai_response_logging_ms", "openai_response_logging_ms"),
         ("qw_ms", "qw"), ("s0_ms", "s0"), ("s1_ms", "s1"),
+        ("kv_tran_total_ms", "kv_tran_total"),
+        ("kv_tran_s0_total_ms", "kv_tran_s0_total_ms"),
         ("kv_tran_s0_ms", "kv_tran_s0"), ("kv_tran_s1_receive_ms", "kv_tran_s1_receive"),
+        ("kv_tran_s1_actual_receive_ms", "kv_tran_s1_actual_receive_ms"),
         ("kv_tran_s1_prep_ms", "kv_tran_s1_prep"),
         ("df_ms", "df"), ("itok", "it"), ("otok", "ot"),
     ]
@@ -526,6 +609,7 @@ def gen(all_batches, clip_stats):
 
 async def main_async():
     print(f"Batch sweep: {N_TOTAL} samples ({N_UNIQUE} unique clips cycled), BS={BS_LIST}")
+    _build_runtime_stage_config()
     print("Loading dataset + preparing clips...")
     avdi = _load_local_avdi()
     ci = avdi.clip_index
@@ -568,6 +652,7 @@ async def main_async():
         print(f"BATCH={bs}  ({n_groups} groups x {bs}, chunk={grp_per_chunk} groups)")
         bs_data = []  # list of {gid, reqs: [...], agg: {...}}
         done_reqs = 0
+        profile_gids = _parse_profile_gid()
 
         for chunk_start in range(0, n_groups, grp_per_chunk):
             chunk_end = min(chunk_start + grp_per_chunk, n_groups)
@@ -577,7 +662,16 @@ async def main_async():
                 grp = samples[start:end]
                 if len(grp) > MAX_REQ_PER_GROUP:
                     raise ValueError(f"Group size {len(grp)} exceeds cap {MAX_REQ_PER_GROUP}")
-                wm, results, agg = await run_group_async(grp, gi, bs)
+                should_profile_group = profile_gids and gi in profile_gids
+                if should_profile_group:
+                    stages_text = PROFILE_STAGES_ENV
+                    print(f"  profiling gid={gi} (g{gi+1}/{n_groups}) for bs={bs} (stages={stages_text})")
+                    _set_profiler_enabled(True)
+                try:
+                    wm, results, agg = await run_group_async(grp, gi, bs)
+                finally:
+                    if should_profile_group:
+                        _set_profiler_enabled(False, 3600)
                 bs_data.append({"gid": gi, "reqs": results, "agg": agg})
                 total_ok = sum(d["agg"]["ok"] for d in bs_data)
                 done_reqs += len(grp)
