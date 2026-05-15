@@ -21,6 +21,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
+import uuid
 
 import numpy as np
 import torch
@@ -39,6 +40,7 @@ def _find_repo_root() -> Path:
 OMNI_ROOT = _find_repo_root()
 ALPAMAYO_SRC = OMNI_ROOT.parent / "alpamayo1.5" / "src"
 VERL_SRC = OMNI_ROOT.parent / "verl-liming" / "my_example" / "alpamayo" / "src"
+REQUEST_UID = os.environ.get("REQUEST_UID", uuid.uuid4().hex[:8])
 
 for path in (str(OMNI_ROOT), str(ALPAMAYO_SRC), str(VERL_SRC)):
     if path not in sys.path:
@@ -62,7 +64,7 @@ MODEL = os.environ.get("MODEL_PATH", DEFAULT_MODEL_PATH)
 T0_US = int(os.environ.get("T0_US", "5100000"))
 N_UNIQUE = int(os.environ.get("N_UNIQUE", "64"))
 N_TOTAL = int(os.environ.get("N_TOTAL", "64"))
-BS_LIST = [int(v) for v in os.environ.get("BS_LIST", "1,2,4,8").split(",") if v.strip()]
+BS_LIST = [int(v) for v in os.environ.get("BS_LIST", "4,8").split(",") if v.strip()]
 MAX_REQ_PER_GROUP = int(os.environ.get("MAX_REQ_PER_GROUP", "24"))
 CHUNK_SAMPLES = int(os.environ.get("CHUNK_SAMPLES", "16"))
 SVC_YAML = OMNI_ROOT / "profiler" / "alpamayo1_5_gpu0.yaml"
@@ -350,7 +352,7 @@ async def one_async(
     bs: int,
     sem: asyncio.Semaphore,
 ) -> dict[str, Any]:
-    rid = f"async-inproc-bs{bs}-{sample['cid'][:8]}-{idx}"
+    rid = f"async-inproc-bs{bs}-{REQUEST_UID}-{sample['cid'][:8]}-{idx}"
     start = time.perf_counter()
 
     async with sem:

@@ -1,5 +1,6 @@
 """Batch sweep: 256 samples (22 unique clips cycled), per-batch-group rows."""
 import asyncio, json, re, sys, time, numpy as np, subprocess, os
+import uuid
 import urllib.request as urllib_request
 from urllib.error import HTTPError
 from pathlib import Path
@@ -25,6 +26,7 @@ from profiler.run_rollout_timing import (
     _load_local_avdi, _load_clip_data, _build_prompt_messages,
     _adapt_messages_with_frames, _to_jsonable,
 )
+from profiler.timestamps import render_request_timeline as request_timeline
 
 DEFAULT_MODEL_PATH = "/share/models/Alpamayo-1.5-10B"
 MODEL    = os.environ.get("MODEL_PATH", str(DEFAULT_MODEL_PATH))
@@ -38,6 +40,7 @@ CHUNK_SAMPLES = 16  # max samples per chunk
 SVC_YAML = OMNI / "profiler" / "alpamayo1_5_gpu0.yaml"
 PROFILE_GID_ENV = os.environ.get("PROFILE_GID", "").strip()
 PROFILE_STAGES_ENV = os.environ.get("PROFILE_STAGES", "0,1").strip()
+REQUEST_UID = os.environ.get("REQUEST_UID", uuid.uuid4().hex[:8])
 
 LOG_DIR = OMNI / "profiler" / "logs" / str(N_TOTAL) / f"async_omni_trace-gid{PROFILE_GID_ENV}_{int(time.time())}"
 ASYNC_OMNI_LOG_DIR = LOG_DIR / "svc_logs"
@@ -318,6 +321,32 @@ def _backfill_kv_metrics_from_log(bs, bs_data):
                 req["kv_s0_transfer_only_ms"] = log_metrics["transfer_only_ms"]
                 req["kv_s0_extract_plus_transfer_ms"] = log_metrics["extract_plus_transfer_ms"]
             # print(req["inf"], req["s0"], req["s1"], req["inf"] - req["s0"] - req["s1"])
+
+
+def _render_timeline_html_for_log(log_path: Path, bs: int) -> Path | None:
+    """Render request timeline HTML for one service log."""
+    if not log_path.exists():
+        print(f"  timeline skip: missing log {log_path}")
+        return None
+
+    try:
+        order, rows = request_timeline.parse_log(log_path)
+        batch_size = request_timeline.infer_batch_size(log_path)
+        if batch_size is None:
+            batch_size = request_timeline.infer_batch_size_from_requests(order)
+        if batch_size is None:
+            batch_size = bs
+        payload = request_timeline.build_requests_payload(order, rows, batch_size)
+        if not payload["requests"]:
+            print(f"  timeline skip: no request metrics found in {log_path.name}")
+            return None
+        output = log_path.with_suffix(log_path.suffix + ".timeline.html")
+        output.write_text(request_timeline.build_html(payload, log_path), encoding="utf-8")
+        print(f"  timeline -> {output}")
+        return output
+    except Exception as exc:
+        print(f"  timeline render failed for {log_path.name}: {exc!r}")
+        return None
         grp["agg"] = _build_group_agg(grp.get("reqs", []), grp["agg"]["wall_ms"])
 
 
@@ -420,6 +449,7 @@ def _build_result_from_response(resp, cid, rid, lat, client_timings=None):
 def one(cid, msg, ai, idx, bs):
     """Send one request; return per-request metrics dict. Skip on timeout."""
     rid = f"bs{bs}-{cid[:8]}-{idx}"
+    rid = f"bs{bs}-{REQUEST_UID}-{cid[:8]}-{idx}"
     st = time.time()
     try:
         resp, client_timings = _post(f"http://{HOST}:{PORT}/v1/chat/completions", {
@@ -697,6 +727,7 @@ async def main_async():
         )
 
         gen(all_batches, cs)
+        _render_timeline_html_for_log(ASYNC_OMNI_LOG_DIR / f"svc_bs{bs}.log", bs)
 
     print(f"\nALL DONE => {OUT}")
 

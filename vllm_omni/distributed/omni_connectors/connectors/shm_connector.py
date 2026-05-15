@@ -86,7 +86,15 @@ class SharedMemoryConnector(OmniConnectorBase):
             obj = self.deserialize_obj(data_bytes)
             return obj, int(shm_handle.get("size", 0))
         except Exception as e:
-            logger.error(f"SharedMemoryConnector shm get failed for req : {e}")
+            logger.error(
+                "SharedMemoryConnector shm get failed: name=%s declared_size=%s payload_size=%s header_size=%s lock=%s error=%s",
+                shm_handle.get("name"),
+                shm_handle.get("size"),
+                shm_handle.get("payload_size"),
+                shm_handle.get("header_size"),
+                lock_file,
+                e,
+            )
             return None
         finally:
             # If data has been received, delete lock_file.

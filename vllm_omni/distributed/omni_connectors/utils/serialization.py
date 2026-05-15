@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 from dataclasses import asdict, is_dataclass
+import threading
 from typing import Any
 
 import msgspec
@@ -326,16 +327,29 @@ class OmniSerde:
     """Serialization/deserialization handler for Omni IPC."""
 
     def __init__(self):
-        self.encoder = OmniMsgpackEncoder()
-        self.decoder = OmniMsgpackDecoder()
+        self._local = threading.local()
+
+    def _get_encoder(self) -> OmniMsgpackEncoder:
+        encoder = getattr(self._local, "encoder", None)
+        if encoder is None:
+            encoder = OmniMsgpackEncoder()
+            self._local.encoder = encoder
+        return encoder
+
+    def _get_decoder(self) -> OmniMsgpackDecoder:
+        decoder = getattr(self._local, "decoder", None)
+        if decoder is None:
+            decoder = OmniMsgpackDecoder()
+            self._local.decoder = decoder
+        return decoder
 
     def serialize(self, obj: Any) -> bytes:
         """Serialize an object to bytes."""
-        return self.encoder.encode(obj)
+        return self._get_encoder().encode(obj)
 
     def deserialize(self, data: bytes | bytearray | memoryview) -> Any:
         """Deserialize bytes to an object."""
-        return self.decoder.decode(data)
+        return self._get_decoder().decode(data)
 
 
 # Global instance for simple interface

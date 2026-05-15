@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import binascii
 import logging
 import os
+import struct
 from multiprocessing import shared_memory as _shm
 from typing import Any
 
@@ -112,13 +114,51 @@ def serialize_obj(obj: Any) -> bytes:
     return OmniSerializer.serialize(obj)
 
 
+_SHM_MAGIC = b"OMNIIPC1"
+_SHM_HEADER_STRUCT = struct.Struct(">8sQI")
+_SHM_HEADER_SIZE = _SHM_HEADER_STRUCT.size
+
+
+def _pack_shm_payload(payload: bytes) -> bytes:
+    crc32 = binascii.crc32(payload) & 0xFFFFFFFF
+    header = _SHM_HEADER_STRUCT.pack(_SHM_MAGIC, len(payload), crc32)
+    return header + payload
+
+
+def _unpack_shm_payload(raw: bytes) -> bytes:
+    if len(raw) < _SHM_HEADER_SIZE:
+        raise ValueError(
+            f"Shared memory payload too small for header: got={len(raw)} bytes, need>={_SHM_HEADER_SIZE}"
+        )
+    magic, payload_size, expected_crc32 = _SHM_HEADER_STRUCT.unpack(raw[:_SHM_HEADER_SIZE])
+    if magic != _SHM_MAGIC:
+        raise ValueError(
+            "Shared memory payload header mismatch: "
+            f"expected_magic={_SHM_MAGIC!r}, got_magic={magic!r}, raw_size={len(raw)}"
+        )
+    payload = raw[_SHM_HEADER_SIZE:]
+    if len(payload) != payload_size:
+        raise ValueError(
+            "Shared memory payload length mismatch: "
+            f"header_payload_size={payload_size}, actual_payload_size={len(payload)}"
+        )
+    actual_crc32 = binascii.crc32(payload) & 0xFFFFFFFF
+    if actual_crc32 != expected_crc32:
+        raise ValueError(
+            "Shared memory payload crc32 mismatch: "
+            f"expected={expected_crc32:#010x}, actual={actual_crc32:#010x}, payload_size={payload_size}"
+        )
+    return payload
+
+
 def shm_write_bytes(payload: bytes, name: str | None = None) -> dict[str, Any]:
     """Write bytes into SharedMemory and return meta dict {name,size}.
 
     Caller should close the segment; the receiver should unlink.
     """
+    packed_payload = _pack_shm_payload(payload)
     try:
-        shm = _shm.SharedMemory(create=True, size=len(payload), name=name)
+        shm = _shm.SharedMemory(create=True, size=len(packed_payload), name=name)
     except FileExistsError:
         if name:
             # If name is specified and exists, unlink it and try again
@@ -127,14 +167,19 @@ def shm_write_bytes(payload: bytes, name: str | None = None) -> dict[str, Any]:
                 existing.unlink()
             except Exception:
                 pass
-            shm = _shm.SharedMemory(create=True, size=len(payload), name=name)
+            shm = _shm.SharedMemory(create=True, size=len(packed_payload), name=name)
         else:
             raise
 
     mv = memoryview(shm.buf)
-    mv[: len(payload)] = payload
+    mv[: len(packed_payload)] = packed_payload
     del mv
-    meta = {"name": shm.name, "size": len(payload)}
+    meta = {
+        "name": shm.name,
+        "size": len(packed_payload),
+        "payload_size": len(payload),
+        "header_size": _SHM_HEADER_SIZE,
+    }
     try:
         shm.close()
     except Exception as e:
@@ -156,7 +201,7 @@ def shm_read_bytes(meta: dict[str, Any]) -> bytes:
         shm.unlink()
     except Exception:
         pass
-    return data
+    return _unpack_shm_payload(data)
 
 
 def maybe_load_from_ipc_with_metrics(

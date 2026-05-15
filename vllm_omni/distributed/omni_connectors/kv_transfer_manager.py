@@ -228,6 +228,16 @@ class OmniKVTransferManager:
                         (t_transfer_done - t0) * 1000.0,
                     )
                     logger.info(f"[Metrics] KV Send req {transfer_req_id} time_ms={(t_transfer_done-t0)*1000.0:.2f} start={t0:.3f} now={t_transfer_done:.3f}")
+                else:
+                    logger.error(
+                        "KV extraction produced no transferable data for req %s "
+                        "(seq_len=%s, num_block_ids=%s, first_block_id=%s, last_block_id=%s).",
+                        req_id,
+                        seq_len,
+                        len(block_ids),
+                        block_ids[0] if block_ids else None,
+                        block_ids[-1] if block_ids else None,
+                    )
 
 
             except Exception as e:
