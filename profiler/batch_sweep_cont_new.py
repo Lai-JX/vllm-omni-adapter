@@ -29,10 +29,10 @@ from profiler.run_rollout_timing import (
 DEFAULT_MODEL_PATH = "/share/models/Alpamayo-1.5-10B"
 MODEL    = os.environ.get("MODEL_PATH", str(DEFAULT_MODEL_PATH))
 HOST, PORT = "127.0.0.1", 8300
-N_UNIQUE = 1 # 22
-N_TOTAL  = 2 # 256
+N_UNIQUE = 64 # 22
+N_TOTAL  = 64 # 256
 # BS_LIST  = [1, 2, 4, 8, 12, 16, 24]
-BS_LIST  = [1]
+BS_LIST  = [1, 2, 4, 8]
 MAX_REQ_PER_GROUP = 24  # Request-side cap for each vLLM processing group
 CHUNK_SAMPLES = 16  # max samples per chunk
 SVC_YAML = OMNI / "profiler" / "alpamayo1_5_gpu0.yaml"
@@ -266,10 +266,13 @@ def _build_group_agg(results, wall_ms):
     n_ok = len(ok_results)
     agg = {"wall_ms": wall_ms, "ok": n_ok}
     metric_keys = [
-        "inf", "s0", "s1",
-        "kv_tran_total", "kv_tran_s0", "kv_tran_s0_total_ms", "kv_tran_s1_receive", "kv_tran_s1_actual_receive_ms", "kv_tran_s1_prep",
-        "stage0_extract_only_ms", "stage0_transfer_only_ms", "stage0_extract_plus_transfer_ms",
-        "df", "qw", "net", "it", "ot",
+        "inf", "net",
+        "s0_llm_ms",
+        "kv_tran_total",
+        "kv_s0_extract_ms", "kv_s0_transfer_only_ms", "kv_s0_extract_plus_transfer_ms",
+        "kv_s1_receive_ms", "kv_s1_tran_ms", "kv_s1_prep_ms",
+        "s1_diffusion_ms",
+        "it", "ot",
         "client_encode_ms", "client_http_ms", "client_decode_ms", "client_codec_ms",
         "openai_handler_total_ms", "openai_pre_full_generator_ms", "openai_result_wait_ms",
         "openai_postprocess_ms", "openai_response_build_ms", "openai_response_logging_ms",
@@ -311,13 +314,10 @@ def _backfill_kv_metrics_from_log(bs, bs_data):
                 continue
             log_metrics = kv_metrics_by_rid.get(req["rid"])
             if log_metrics:
-                req["stage0_extract_only_ms"] = log_metrics["extract_only_ms"]
-                req["stage0_transfer_only_ms"] = log_metrics["transfer_only_ms"]
-                req["stage0_extract_plus_transfer_ms"] = log_metrics["extract_plus_transfer_ms"]
-                req["kv_tran_s0_total_ms"] = log_metrics["extract_plus_transfer_ms"]
-            req["s0"] = req["stage0_llm_ms"] # + req["kv_tran_s0_total_ms"]
+                req["kv_s0_extract_ms"] = log_metrics["extract_only_ms"]
+                req["kv_s0_transfer_only_ms"] = log_metrics["transfer_only_ms"]
+                req["kv_s0_extract_plus_transfer_ms"] = log_metrics["extract_plus_transfer_ms"]
             # print(req["inf"], req["s0"], req["s1"], req["inf"] - req["s0"] - req["s1"])
-            req["qw"] = max(0.0, req["inf"] - req["s0"] - req["s1"])
         grp["agg"] = _build_group_agg(grp.get("reqs", []), grp["agg"]["wall_ms"])
 
 
@@ -328,13 +328,13 @@ def _build_result_from_response(resp, cid, rid, lat, client_timings=None):
     co = m.get("custom_output", {}) or {}
     inf = float(m.get("inference_only_ms", 0) or 0)
     llm_ms = float(m.get("stage0_llm_ms", 0) or 0)
-    kv_tran_s0_start_time = float(co.get("kv_tran_s0_start_time", 0) or 0)
-    kv_tran_s1_reveive_end_time = float(co.get("kv_tran_s1_reveive_end_time", 0) or 0)
-    kv_tran_s0 = float(co.get("kv_tran_s0_ms", 0) or 0) # 只包含stage-0 extract kv的时间
-    kv_tran_s0_total_ms = kv_tran_s0
-    kv_tran_s1_receive = float(co.get("kv_tran_s1_receive_ms", 0) or 0)
-    kv_tran_s1_actual_receive_ms = float(co.get("kv_tran_s1_actual_receive_ms", 0) or 0)
-    df = float(co.get("df_ms", 0) or 0)
+    kv_s0_start_time = float(co.get("kv_s0_start_time", 0) or 0)
+    kv_s0_extract_ms = float(co.get("kv_s0_extract_ms", 0) or 0) # 只包含stage-0 extract kv的时间
+    kv_s1_receive_ms = float(co.get("kv_s1_receive_ms", 0) or 0)
+    kv_s1_tran_ms = float(co.get("kv_s1_tran_ms", 0) or 0)
+    kv_s1_end_time = float(co.get("kv_s1_end_time", 0) or 0)
+    kv_s1_prep_ms = float(co.get("kv_s1_prep_ms", 0) or 0)
+    s1_diffusion_ms = float(co.get("s1_diffusion_ms", 0) or 0)
     client_encode_ms = float(client_timings.get("client_encode_ms", 0.0) or 0.0)
     client_http_ms = float(client_timings.get("client_http_ms", 0.0) or 0.0)
     client_decode_ms = float(client_timings.get("client_decode_ms", 0.0) or 0.0)
@@ -368,11 +368,8 @@ def _build_result_from_response(resp, cid, rid, lat, client_timings=None):
     api_server_response_dump_ms = float(m.get("api_server_response_dump_ms", 0.0) or 0.0)
     api_server_response_render_ms = float(m.get("api_server_response_render_ms", 0.0) or 0.0)
     api_server_route_total_ms = float(m.get("api_server_route_total_ms", 0.0) or 0.0)
-    s0  = llm_ms + kv_tran_s0_total_ms
-    s1  = kv_tran_s1_receive + df
     return {"ok": True, "c": cid, "rid": rid, "lat": lat, "inf": inf,
-            "stage0_llm_ms": llm_ms,
-            "s0": s0, "s1": s1, "qw": max(0., inf-s0-s1), "net": lat-inf,
+            "s0_llm_ms": llm_ms, "net": lat-inf,
         "client_encode_ms": client_encode_ms,
         "client_http_ms": client_http_ms,
         "client_decode_ms": client_decode_ms,
@@ -407,17 +404,14 @@ def _build_result_from_response(resp, cid, rid, lat, client_timings=None):
         "api_server_response_dump_ms": api_server_response_dump_ms,
         "api_server_response_render_ms": api_server_response_render_ms,
         "api_server_route_total_ms": api_server_route_total_ms,
-        "kv": kv_tran_s1_receive,
-        "kv_tran_total": (kv_tran_s1_reveive_end_time-kv_tran_s0_start_time) * 1000 if kv_tran_s0_start_time and kv_tran_s1_reveive_end_time else 0.0,
-        "stage0_extract_only_ms": kv_tran_s0,
-        "stage0_transfer_only_ms": 0.0,
-        "stage0_extract_plus_transfer_ms": kv_tran_s0_total_ms,
-        "kv_tran_s0_total_ms": kv_tran_s0_total_ms,
-        "kv_tran_s0": kv_tran_s0,
-        "kv_tran_s1_receive": kv_tran_s1_receive,
-        "kv_tran_s1_actual_receive_ms": kv_tran_s1_actual_receive_ms,
-        "kv_tran_s1_prep": float(co.get("kv_tran_s1_prep_ms", 0) or 0),
-        "df": df,
+        "kv_tran_total": (kv_s1_end_time-kv_s0_start_time) * 1000 if kv_s0_start_time and kv_s1_end_time else 0.0,
+        "kv_s0_extract_ms": kv_s0_extract_ms,
+        "kv_s0_transfer_only_ms": 0.0,          # 后续填充
+        "kv_s0_extract_plus_transfer_ms": 0.0,  # 后续填充
+        "kv_s1_receive_ms": kv_s1_receive_ms,
+        "kv_s1_tran_ms": kv_s1_tran_ms,
+        "kv_s1_prep_ms": kv_s1_prep_ms,
+        "s1_diffusion_ms": s1_diffusion_ms,
         "it": int(m.get("input_tokens", 0) or 0),
         "ot": len(co.get("cot_token_ids", []))}
 
@@ -483,8 +477,8 @@ def gen(all_batches, clip_stats):
          "",
          "## 表1: 逐请求详细指标",
          "",
-         "| bs | gid | rid | lat_ms | net_ms | inf_ms | qw_ms | s0_ms | s1_ms | kv_total_ms | kv_s0_total_ms | kv_ms | kv_s1_actual_receive_ms | df_ms | itok | otok |",
-         "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+         "| bs | gid | rid | lat_ms | net_ms | inf_ms | s0_llm_ms | kv_tran_total | s1_diffusion_ms | kv_s0_extract_plus_transfer_ms | kv_s1_receive_ms | itok | otok |",
+         "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
 
     for bs in BS_LIST:
         for grp in all_batches.get(bs, []):
@@ -492,8 +486,9 @@ def gen(all_batches, clip_stats):
                 if not req.get("ok"):
                     continue
                 L.append(f"| {bs} | {grp['gid']} | {req['rid']} | {req['lat']:.0f} | {req['net']:.0f}"
-                         f" | {req['inf']:.0f} | {req['qw']:.0f} | {req['s0']:.0f} | {req['s1']:.0f}"
-                         f" | {req['kv_tran_total']:.0f} | {req['kv_tran_s0_total_ms']:.0f} | {req['kv']:.0f} | {req['kv_tran_s1_actual_receive_ms']:.0f} | {req['df']:.0f} | {req['it']} | {req['ot']} |")
+                         f" | {req['inf']:.0f} | {req['s0_llm_ms']:.0f} | {req['kv_tran_total']:.0f}"
+                         f" | {req['s1_diffusion_ms']:.0f} | {req['kv_s0_extract_plus_transfer_ms']:.0f}"
+                         f" | {req['kv_s1_receive_ms']:.0f} | {req['it']} | {req['ot']} |")
 
     L += ["",
           "## 表2: 逐 BS 请求级指标统计",
@@ -541,13 +536,16 @@ def gen(all_batches, clip_stats):
         ("openai_postprocess_ms", "openai_postprocess_ms"),
         ("openai_response_build_ms", "openai_response_build_ms"),
         ("openai_response_logging_ms", "openai_response_logging_ms"),
-        ("qw_ms", "qw"), ("s0_ms", "s0"), ("s1_ms", "s1"),
+        ("s0_llm_ms", "s0_llm_ms"),
         ("kv_tran_total_ms", "kv_tran_total"),
-        ("kv_tran_s0_total_ms", "kv_tran_s0_total_ms"),
-        ("kv_tran_s0_ms", "kv_tran_s0"), ("kv_tran_s1_receive_ms", "kv_tran_s1_receive"),
-        ("kv_tran_s1_actual_receive_ms", "kv_tran_s1_actual_receive_ms"),
-        ("kv_tran_s1_prep_ms", "kv_tran_s1_prep"),
-        ("df_ms", "df"), ("itok", "it"), ("otok", "ot"),
+        ("kv_s0_extract_ms", "kv_s0_extract_ms"),
+        ("kv_s0_transfer_only_ms", "kv_s0_transfer_only_ms"),
+        ("kv_s0_extract_plus_transfer_ms", "kv_s0_extract_plus_transfer_ms"),
+        ("kv_s1_receive_ms", "kv_s1_receive_ms"),
+        ("kv_s1_tran_ms", "kv_s1_tran_ms"),
+        ("kv_s1_prep_ms", "kv_s1_prep_ms"),
+        ("s1_diffusion_ms", "s1_diffusion_ms"),
+        ("itok", "it"), ("otok", "ot"),
     ]
     for bs in BS_LIST:
         # collect all request values across all groups

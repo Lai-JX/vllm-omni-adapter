@@ -211,8 +211,8 @@ class OmniKVTransferManager:
                 if kv_data:
                     # Record s0-side KV transfer time in metadata
                     t_extract_done = time.time()
-                    kv_data.metadata["kv_tran_s0_ms"] = (t_extract_done - t0) * 1000.0
-                    kv_data.metadata["kv_tran_s0_start_time"] = t0
+                    kv_data.metadata["kv_s0_extract_ms"] = (t_extract_done - t0) * 1000.0
+                    kv_data.metadata["kv_s0_start_time"] = t0
 
                     # Resolve global request ID if available
                     transfer_req_id = request_id_resolver(req_id) if request_id_resolver else req_id
@@ -440,9 +440,8 @@ class OmniKVTransferManager:
                     kv_receive_time = now - kv_receive_start
                     logger.info(f"[Metrics] KV Receive req {request_id} time_ms={kv_receive_time*1000.0:.2f} start={kv_receive_start:.3f} now={now:.3f}")
                     kv_revceive_msg = {
-                        "kv_receive_time_ms": kv_receive_time * 1000.0,
-                        "kv_receive_start": kv_receive_start,
-                        "kv_receive_end": now,
+                        "kv_s1_tran_ms": kv_receive_time * 1000.0,
+                        "kv_s1_end_time": now,
                     }
                     return data, size, kv_revceive_msg
 
@@ -533,7 +532,6 @@ class OmniKVTransferManager:
         Returns:
             True if primary KV cache was received successfully.
         """
-        t0 = time.perf_counter()
         primary_ok, kv_receive_msg = self.receive_kv_cache(req, target_device)
 
         cfg_ids = getattr(getattr(req, "sampling_params", None), "cfg_kv_request_ids", None)
@@ -555,9 +553,7 @@ class OmniKVTransferManager:
             except Exception:
                 logger.exception("Failed to collect CFG KV caches for %s", request_id)
 
-        kv_receive_ms = (time.perf_counter() - t0) * 1000.0
         if hasattr(req, "sampling_params") and req.sampling_params is not None:
-            req.sampling_params._kv_receive_ms = kv_receive_ms
             if kv_receive_msg:
                 for k, v in kv_receive_msg.items():
                     setattr(req.sampling_params, k, v)

@@ -252,12 +252,12 @@ class DiffusionModelRunner:
                 kv_transfer_ms = (time.perf_counter() - t_kv_start) * 1000.0
                 if req.sampling_params is not None:
                     # Top-level s1 segment timing for ratio check.
-                    req.sampling_params._kv_receive_ms = kv_transfer_ms
+                    req.sampling_params.kv_s1_receive_ms = kv_transfer_ms
                     # Extract s0-side KV transfer time from received metadata
                     kv_meta = getattr(req, "kv_metadata", None) or {}
                     if isinstance(kv_meta, dict):
-                        req.sampling_params._kv_tran_s0_ms = kv_meta.get("kv_tran_s0_ms", 0.0)
-                        req.sampling_params._kv_tran_s0_start_time = kv_meta.get("kv_tran_s0_start_time", None)
+                        req.sampling_params.kv_s0_extract_ms = kv_meta.get("kv_s0_extract_ms", 0.0)
+                        req.sampling_params.kv_s0_start_time = kv_meta.get("kv_s0_start_time", None)
 
             if req.sampling_params.generator is None and req.sampling_params.seed is not None:
                 if req.sampling_params.generator_device is not None:
@@ -267,9 +267,6 @@ class DiffusionModelRunner:
                 else:
                     gen_device = self.device
                 req.sampling_params.generator = torch.Generator(device=gen_device).manual_seed(req.sampling_params.seed)
-
-            # Top-level diffusion segment starts before refresh + forward.
-            t_diff_start = time.perf_counter()
 
             # Refresh cache context if needed
             if (
@@ -287,10 +284,6 @@ class DiffusionModelRunner:
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 with record_function("pipeline_forward"):
                     output = self.pipeline.forward(req)
-
-            diffusion_ms = (time.perf_counter() - t_diff_start) * 1000.0
-            if req.sampling_params is not None:
-                req.sampling_params._s1_diffusion_ms = diffusion_ms
 
             if is_primary:
                 self._record_peak_memory(output)

@@ -976,24 +976,23 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
         forward_total_ms = (now - t_forward_start) * 1000.0
         logger.info(f"[Metrics] Stage 1 diffusion req {req_id} time_ms={forward_total_ms:.2f} start={t_forward_start:.3f} now={now:.3f}")
 
-        diffusion_ms = getattr(req.sampling_params, "_s1_diffusion_ms", forward_total_ms)
-        kv_transfer_ms = getattr(req.sampling_params, "_kv_receive_ms", 0.0)
+        s1_diffusion_ms = forward_total_ms
         custom_output: dict[str, Any] = {
             "pred_xyz": pred_xyz_list[0] if len(pred_xyz_list) == 1 else pred_xyz_list,
             "pred_rot": pred_rot_list[0] if len(pred_rot_list) == 1 else pred_rot_list,
             "cot_token_ids": _flatten_cot(cot_ids_list[0] if len(cot_ids_list) == 1 else cot_ids_list),
             "stage0_context_used": getattr(req.sampling_params, "past_key_values", None) is not None,
-            "kv_tran_s0_start_time": getattr(req.sampling_params, "_kv_tran_s0_start_time", None),
-            "kv_tran_s0_ms": getattr(req.sampling_params, "_kv_tran_s0_ms", 0.0),
-            "kv_tran_s1_receive_ms": kv_transfer_ms,
-            "kv_tran_s1_actual_receive_ms": getattr(req.sampling_params, "kv_receive_time_ms", None),
-            "kv_tran_s1_reveive_end_time": getattr(req.sampling_params, "kv_receive_end", None),
-            "kv_tran_s1_prep_ms": kv_ms_list[0] if len(kv_ms_list) == 1 else kv_ms_list,
-            "df_ms": diffusion_ms,
+            "kv_s0_start_time": getattr(req.sampling_params, "kv_s0_start_time", None),
+            "kv_s0_extract_ms": getattr(req.sampling_params, "kv_s0_extract_ms", 0.0),
+            "kv_s1_receive_ms": getattr(req.sampling_params, "kv_s1_receive_ms", 0.0),
+            "kv_s1_tran_ms": getattr(req.sampling_params, "kv_s1_tran_ms", None),
+            "kv_s1_end_time": getattr(req.sampling_params, "kv_s1_end_time", None),
+            "kv_s1_prep_ms": kv_ms_list[0] if len(kv_ms_list) == 1 else kv_ms_list,
+            "s1_diffusion_ms": s1_diffusion_ms,
             "stage1_forward_total_ms": forward_total_ms,
             "stage1_diffusion_inner_ms": diff_ms_list[0] if len(diff_ms_list) == 1 else diff_ms_list,
-            "kv_transfer_runner_ms": kv_transfer_ms,
-            "diffusion_runner_ms": diffusion_ms,
+            "kv_transfer_runner_ms": getattr(req.sampling_params, "kv_s1_receive_ms", 0.0),
+            "diffusion_runner_ms": s1_diffusion_ms,
         }
         trajectory_latents = pred_xyz_list[0] if len(pred_xyz_list) == 1 else None
         return DiffusionOutput(
