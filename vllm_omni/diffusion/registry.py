@@ -245,6 +245,16 @@ _DIFFUSION_MODELS = {
         "pipeline_diffusers_adapter",
         "DiffusersAdapterPipeline",
     ),
+    "Alpamayo1_5TrajectoryPipeline": (
+        "alpamayo1_5",
+        "pipeline_alpamayo1_5",
+        "Alpamayo1_5TrajectoryPipeline",
+    ),
+    "Alpamayo1_5": (
+        "alpamayo1_5",
+        "pipeline_alpamayo1_5",
+        "Alpamayo1_5TrajectoryPipeline",
+    ),
 }
 
 

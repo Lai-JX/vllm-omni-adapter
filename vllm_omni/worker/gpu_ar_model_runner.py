@@ -294,6 +294,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
         return combined_hidden_states, combined_multimodal_outputs
 
+    def get_kv_connector_connection_info(self) -> dict[str, Any] | None:
+        """Return sender connector info for stage orchestration."""
+        return self.kv_transfer_manager.get_connector_connection_info()
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -948,7 +952,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         end,
                     )
                 payload: dict[str, object] = {"hidden": req_hidden_states}
-
+                add_info = self.model_intermediate_buffer.get(rid, {})
                 mm_payload: dict[str, object] = {}
                 if combined_multimodal_outputs or mm_cpu:
                     if combined_multimodal_outputs:
@@ -978,7 +982,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     payload.update(mm_payload)
                 # Flatten nested dicts to dotted keys so pooling_output
                 # stays dict[str, torch.Tensor] for msgspec serialization.
-                pooler_output.append(flatten_payload(payload))
+    
+            prompt_mrope_position_delta = add_info.get("prompt_mrope_position_delta")
+            if prompt_mrope_position_delta is not None:
+                if isinstance(prompt_mrope_position_delta, torch.Tensor):
+                    prompt_mrope_position_delta = (
+                        prompt_mrope_position_delta.detach().to("cpu").contiguous()
+                    )
+                else:
+                    prompt_mrope_position_delta = torch.as_tensor(
+                        prompt_mrope_position_delta,
+                        dtype=torch.long,
+                    )
+                payload["prompt_mrope_position_delta"] = prompt_mrope_position_delta
+
+            pooler_output.append(flatten_payload(payload))
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
                 capturer = RoutedExpertsCapturer.get_instance()

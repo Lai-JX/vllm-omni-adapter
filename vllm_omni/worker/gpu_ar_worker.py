@@ -125,3 +125,13 @@ class GPUARWorker(OmniWorkerMixin, OmniGPUWorkerBase):
         if isinstance(task, dict):
             task = OmniWakeTask(**task)
         return super().handle_wake_task(task)
+
+    def get_kv_connector_connection_info(self) -> dict[str, object] | None:
+        """Expose sender connector info for stage orchestration RPCs."""
+        model_runner = getattr(self, "model_runner", None)
+        if model_runner is None:
+            logger.warning("get_kv_connector_connection_info called before model_runner is initialized")
+            return None
+        info = model_runner.get_kv_connector_connection_info()
+        logger.info("get_kv_connector_connection_info -> %s", info)
+        return info

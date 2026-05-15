@@ -117,7 +117,7 @@ from vllm_omni.entrypoints.openai.protocol.videos import (
 )
 from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
-from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
+from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat, OmniStructuredOutputOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import OmniOpenAIServingVideo, ReferenceImage
@@ -160,6 +160,56 @@ def _should_enable_profiler_endpoints(stage_configs: list | None) -> bool:
             )
             if profiler is not None:
                 return True
+    return False
+
+
+def _get_stage_cfg_value(stage_cfg: Any, key: str, default: Any = None) -> Any:
+    if isinstance(stage_cfg, dict):
+        return stage_cfg.get(key, default)
+    if hasattr(stage_cfg, "get"):
+        try:
+            return stage_cfg.get(key, default)
+        except Exception:
+            pass
+    return getattr(stage_cfg, key, default)
+
+
+def _get_engine_arg_value(stage_cfg: Any, key: str, default: Any = None) -> Any:
+    engine_args = _get_stage_cfg_value(stage_cfg, "engine_args", None)
+    if isinstance(engine_args, dict):
+        return engine_args.get(key, default)
+    return getattr(engine_args, key, default) if engine_args is not None else default
+
+
+def _should_use_structured_output_chat_handler(
+    args: Namespace,
+    stage_configs: list | None,
+) -> bool:
+    model_names = [str(args.model or "")]
+    served_model_names = getattr(args, "served_model_name", None) or []
+    model_names.extend(str(name) for name in served_model_names if name)
+    if any("alpamayo" in name.lower() for name in model_names):
+        return True
+
+    if not stage_configs:
+        return False
+
+    for stage_cfg in stage_configs:
+        final_output_type = _get_stage_cfg_value(stage_cfg, "final_output_type", None)
+        model_arch = str(_get_engine_arg_value(stage_cfg, "model_arch", "") or "")
+        model_subdir = str(_get_engine_arg_value(stage_cfg, "model_subdir", "") or "")
+        custom_process_input_func = str(_get_stage_cfg_value(stage_cfg, "custom_process_input_func", "") or "")
+
+        if (
+            final_output_type == "trajectory"
+            and (
+                "alpamayo" in model_arch.lower()
+                or "alpamayo" in model_subdir.lower()
+                or "alpamayo" in custom_process_input_func.lower()
+            )
+        ):
+            return True
+
     return False
 
 
@@ -590,6 +640,11 @@ async def omni_init_app_state(
     # For omni models
     state.stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
     model_name = served_model_names[0] if served_model_names else args.model
+    chat_serving_cls = (
+        OmniStructuredOutputOpenAIServingChat
+        if _should_use_structured_output_chat_handler(args, state.stage_configs)
+        else OmniOpenAIServingChat
+    )
 
     # Pure Diffusion mode: use simplified initialization logic
     if is_pure_diffusion:
@@ -600,7 +655,7 @@ async def omni_init_app_state(
         state.openai_serving_tokenization = None
 
         # Use for_diffusion method to create chat handler
-        state.openai_serving_chat = OmniOpenAIServingChat.for_diffusion(
+        state.openai_serving_chat = chat_serving_cls.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
             model_name=model_name,
         )
@@ -759,7 +814,7 @@ async def omni_init_app_state(
         else None
     )
     state.openai_serving_chat = (
-        OmniOpenAIServingChat(
+        chat_serving_cls(
             engine_client,
             state.openai_serving_models,
             args.response_role,

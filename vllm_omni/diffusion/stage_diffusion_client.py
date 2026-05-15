@@ -133,6 +133,7 @@ class StageDiffusionClient:
         self._decoder = OmniMsgpackDecoder()
 
         self._output_queue: asyncio.Queue[OmniRequestOutput] = asyncio.Queue()
+        self._upstream_request_outputs: dict[str, Any] = {}
         self._rpc_results: dict[str, Any] = {}
         self._pending_rpcs: set[str] = set()
         self._tasks: dict[str, asyncio.Task] = {}
@@ -210,7 +211,11 @@ class StageDiffusionClient:
             msg_type = msg.get("type")
 
             if msg_type == "result":
-                self._output_queue.put_nowait(msg["output"])
+                output = msg["output"]
+                req_id = getattr(output, "request_id", None)
+                if req_id is not None:
+                    output._upstream_request_output = self._upstream_request_outputs.pop(req_id, None)
+                self._output_queue.put_nowait(output)
             elif msg_type == "rpc_result":
                 self._rpc_results[msg["rpc_id"]] = msg["result"]
             elif msg_type == "error":
@@ -233,6 +238,7 @@ class StageDiffusionClient:
                 # Route request errors as error outputs so the Orchestrator
                 # sees the request complete (instead of hanging forever).
                 if req_id is not None:
+                    self._upstream_request_outputs.pop(req_id, None)
                     self._output_queue.put_nowait(OmniRequestOutput.from_error(req_id, error_msg))
 
     # Fields that are subprocess-local and cannot be serialized across
@@ -296,9 +302,11 @@ class StageDiffusionClient:
         prompt: OmniPromptType,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        upstream_request_output: Any | None = None,
     ) -> None:
         if self._engine_dead:
             raise EngineDeadError()
+        self._upstream_request_outputs[request_id] = upstream_request_output
         logger.info(
             "[StageDiffusionClient] stage-%s [rep-%s] add request: %s",
             self.stage_id,
@@ -325,6 +333,7 @@ class StageDiffusionClient:
         prompts: list[OmniPromptType],
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        upstream_request_output: Any | None = None,
     ) -> None:
         """Submit a list of prompts as a single batched engine call.
 
@@ -334,6 +343,7 @@ class StageDiffusionClient:
         """
         if self._engine_dead:
             raise EngineDeadError()
+        self._upstream_request_outputs[request_id] = upstream_request_output
         logger.info(
             "[StageDiffusionClient] stage-%s [rep-%s] add batch request: %s (%d prompts)",
             self.stage_id,
@@ -347,7 +357,7 @@ class StageDiffusionClient:
                 prompts,
                 sampling_params,
                 kv_sender_info,
-            ),
+                upstream_request_output),
             name=f"diffusion-batch-{request_id}",
         )
         self._tasks[request_id] = task
@@ -358,6 +368,7 @@ class StageDiffusionClient:
         prompts: list[OmniPromptType],
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        upstream_request_output: Any | None = None,
     ) -> None:
         try:
             self._request_socket.send(
@@ -417,6 +428,8 @@ class StageDiffusionClient:
                 }
             )
         )
+        for req_id in request_ids:
+            self._upstream_request_outputs.pop(req_id, None)
 
     async def collective_rpc_async(
         self,

@@ -684,6 +684,38 @@ class AsyncOmni(EngineClient, OmniBase):
         if self.log_stats:
             logger.info("[AsyncOmni] Aborted request(s) %s", ",".join(request_ids))
 
+    async def wait_for_requests_to_drain(self, drain_timeout: int = 300) -> None:
+        """Wait until all in-flight AsyncOmni requests finish.
+
+        This mirrors ``AsyncLLM.wait_for_requests_to_drain`` but uses the
+        client-side request bookkeeping already maintained by ``AsyncOmni``.
+        A request remains "in flight" until its per-request state is cleaned up,
+        which happens after the final output has been processed or the request
+        has been aborted.
+        """
+        deadline = time.monotonic() + drain_timeout
+        while True:
+            if not self.request_states:
+                logger.info("[AsyncOmni] Requests have been drained")
+                return
+
+            self.check_health()
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                active_request_ids = ",".join(sorted(self.request_states))
+                raise TimeoutError(
+                    f"Timeout reached after {drain_timeout} seconds waiting for requests to drain. "
+                    f"Active requests: {active_request_ids}"
+                )
+
+            logger.info(
+                "[AsyncOmni] Waiting for %d request(s) to drain: %s",
+                len(self.request_states),
+                ",".join(sorted(self.request_states)),
+            )
+            await asyncio.sleep(min(1.0, remaining))
+
     async def pause_generation(
         self,
         *,
@@ -697,7 +729,8 @@ class AsyncOmni(EngineClient, OmniBase):
                 return
             self._paused = True
 
-        # TODO: Implement request draining if wait_for_inflight_requests
+        if wait_for_inflight_requests:
+            await self.wait_for_requests_to_drain()
 
         if clear_cache:
             # Clear caches for all stages.
@@ -863,11 +896,19 @@ class AsyncOmni(EngineClient, OmniBase):
         """List all loaded LoRA adapter IDs across stages."""
         results = await self.collective_rpc(method="list_loras")
         merged: set[int] = set()
+
+        def _collect_ids(value: Any) -> None:
+            if isinstance(value, int):
+                merged.add(value)
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    _collect_ids(item)
+
         for result in results:
             if isinstance(result, dict) and result.get("todo"):
                 continue
-            if isinstance(result, list):
-                merged.update(result)
+            _collect_ids(result)
         return sorted(merged)
 
     async def pin_lora(self, adapter_id: int) -> bool:

@@ -71,6 +71,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         # Cache per-request flag to avoid repeated deserialization of additional_information
         self._omits_kv_transfer_cache: dict[str, bool] = {}
+        # Track requests that saw a sentinel token and should transfer on
+        # the immediately following decode step.
+        self.next_step_transfer_armed_requests: set[str] = set()
         model_config = self.vllm_config.model_config
         self.chunk_transfer_adapter = None
         if getattr(model_config, "async_chunk", False):
@@ -117,6 +120,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._omits_kv_transfer_cache[rid] = result
         return result
 
+    def _clear_transfer_tracking(self, request_id: str) -> None:
+        self.transfer_triggered_requests.discard(request_id)
+        self.active_kv_transfers.discard(request_id)
+        self.next_step_transfer_armed_requests.discard(request_id)
+
     def _process_kv_transfer_trigger(self, request: Request, new_token_ids: list[int]) -> bool:
         """
         Check triggers and process side effects (marking transfer).
@@ -152,6 +160,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # seq_len for KV transfer must exclude async placeholders.
         confirmed_computed = self._get_confirmed_num_computed_tokens(request)
 
+        if request.request_id in self.next_step_transfer_armed_requests:
+            logger.debug(
+                "[Omni] Request %s triggered next-step KV transfer (Non-Stop)",
+                request.request_id,
+            )
+            self.next_step_transfer_armed_requests.remove(request.request_id)
+            self.transfer_triggered_requests.add(request.request_id)
+            self._mark_request_for_kv_transfer(
+                request.request_id,
+                request.num_computed_tokens,
+            )
+            return False
+
         if criteria_type == "prefill_finished":
             if confirmed_computed >= request.num_prompt_tokens:
                 self.transfer_triggered_requests.add(request.request_id)
@@ -185,6 +206,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if stop_decode_on_trigger and actually_queued:
                     self.pending_stop_after_extraction.add(request.request_id)
 
+                return False
+        elif criteria_type == "next_step_after_special_token":
+            target_token_id = self.kv_transfer_criteria.get("token_id")
+            if target_token_id is not None and target_token_id in new_token_ids:
+                logger.debug(
+                    "[Omni] Request %s armed next_step_after_special_token criteria",
+                    request.request_id,
+                )
+                self.next_step_transfer_armed_requests.add(request.request_id)
                 return False
 
         return False
@@ -368,6 +398,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
+            # Evaluate transfer triggers even when the request just stopped on
+            # this step, so a stop token can still produce a transfer snapshot.
             # If criteria returns True, it means we must STOP the request.
             # If criteria returns False, it might have triggered a background
             # transfer (e.g. prefill finished / special token) but continues decoding.
@@ -474,19 +506,13 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # [Omni] Cleanup state for finished requests
         for req in stopped_running_reqs:
             if req.request_id not in self.waiting_for_transfer_free:
-                if req.request_id in self.transfer_triggered_requests:
-                    self.transfer_triggered_requests.remove(req.request_id)
-                if req.request_id in self.active_kv_transfers:
-                    self.active_kv_transfers.remove(req.request_id)
+                self._clear_transfer_tracking(req.request_id)
                 self.pending_stop_after_extraction.discard(req.request_id)
 
         # Same for preempted
         for req in stopped_preempted_reqs:
             if req.request_id not in self.waiting_for_transfer_free:
-                if req.request_id in self.transfer_triggered_requests:
-                    self.transfer_triggered_requests.remove(req.request_id)
-                if req.request_id in self.active_kv_transfers:
-                    self.active_kv_transfers.remove(req.request_id)
+                self._clear_transfer_tracking(req.request_id)
                 self.pending_stop_after_extraction.discard(req.request_id)
 
         # KV Connector: update state for finished KV Transfers.
@@ -545,10 +571,9 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                             self.kv_cache_manager.free(req)
                             if req_id in self.requests:
                                 del self.requests[req_id]
-                            if req_id in self.transfer_triggered_requests:
-                                self.transfer_triggered_requests.remove(req_id)
-                            self.active_kv_transfers.discard(req_id)
+                            self._clear_transfer_tracking(req_id)
                             self.pending_stop_after_extraction.discard(req_id)
+
                             logger.debug(f"Freed blocks for {req_id} after transfer extraction")
                         self.waiting_for_transfer_free.remove(req_id)
                 except Exception:

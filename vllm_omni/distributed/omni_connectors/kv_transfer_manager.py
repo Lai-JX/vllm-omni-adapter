@@ -718,6 +718,42 @@ class OmniKVTransferManager:
             self._tp_topo.local_rank,
         )
 
+    def get_connector_connection_info(self) -> dict[str, Any] | None:
+        """Return connector-side connection info when supported.
+
+        MooncakeTransferEngineConnector exposes ``get_connection_info()``
+        so the sender stage can tell the receiver where to query metadata
+        when the control plane does not forward per-request metadata.
+        """
+        connector = self.connector
+        if connector is None:
+            return None
+        getter = getattr(connector, "get_connection_info", None)
+        if getter is None:
+            return None
+        try:
+            info = getter()
+        except Exception as e:
+            logger.warning("Failed to get connector connection info: %s", e)
+            return None
+        return info if isinstance(info, dict) else None
+
+    def update_receiver_sender_info(self, sender_host: str, sender_zmq_port: int) -> bool:
+        """Inject sender connection info into the receiver connector.
+
+        This is primarily used by MooncakeTransferEngineConnector when the
+        receive path calls ``get(..., metadata=None)`` and therefore needs
+        an explicit sender endpoint for metadata queries.
+        """
+        connector = self.connector
+        if connector is None:
+            return False
+        updater = getattr(connector, "update_sender_info", None)
+        if updater is None:
+            return False
+        updater(sender_host, int(sender_zmq_port))
+        return True
+
     def handle_finished_requests_kv_transfer(
         self,
         finished_reqs: dict[str, dict[str, Any]],

@@ -20,6 +20,7 @@ import uuid
 import weakref
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
+from copy import copy
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
@@ -30,8 +31,10 @@ from vllm import envs as vllm_envs
 from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
+from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.engine.parallel_sampling import ParentRequest
 
 from vllm_omni.config.stage_config import strip_parent_engine_args
 from vllm_omni.diffusion.data import DiffusionParallelConfig
@@ -998,6 +1001,9 @@ class AsyncOmniEngine:
 
         stage_pools: list[StagePool] = []
         input_processor: InputProcessor | None = None
+        prompt_rewrite_func = None
+        renderer_rewrite_func = None
+        request_postprocess_func = None
         initialized_clients_by_stage: dict[int, list[Any | None]] = {
             plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
         }
@@ -1005,9 +1011,16 @@ class AsyncOmniEngine:
         try:
             initialized_clients_by_stage = self._initialize_stage_replicas(stage_plans, stage_init_timeout)
             if stage_plans and stage_plans[0].replicas[0].metadata.stage_type != "diffusion":
+                stage0_metadata = stage_plans[0].replicas[0].metadata
                 stage0_vllm_config = stage_plans[0].replicas[0].stage_vllm_config
                 assert stage0_vllm_config is not None
-                input_processor = build_stage0_input_processor(stage0_vllm_config)
+                prompt_rewrite_func = stage0_metadata.prompt_rewrite_func
+                renderer_rewrite_func = stage0_metadata.renderer_rewrite_func
+                request_postprocess_func = stage0_metadata.request_postprocess_func
+                input_processor = build_stage0_input_processor(
+                    stage0_vllm_config,
+                    renderer_rewrite_func=renderer_rewrite_func,
+                )
             stage_pools = self._assemble_stage_pools(stage_plans, initialized_clients_by_stage)
         except Exception as exc:
             initialized_clients_by_stage = getattr(
@@ -1033,6 +1046,8 @@ class AsyncOmniEngine:
 
         self.stage_pools = stage_pools
         self.input_processor = input_processor
+        self.prompt_rewrite_func = prompt_rewrite_func
+        self.request_postprocess_func = request_postprocess_func
         self.prompt_expand_func = prompt_expand_func
 
         # Derive logical-stage views for external readers (entrypoints/async_omni.py).
@@ -1173,6 +1188,13 @@ class AsyncOmniEngine:
 
         # Keep the original prompt for downstream stages (they need the raw
         # dict, e.g. for multi_modal_data).
+        if self.prompt_rewrite_func is not None and not isinstance(prompt, EngineCoreRequest):
+            try:
+                prompt = self.prompt_rewrite_func(prompt, params)
+            except Exception:
+                logger.exception("[AsyncOmniEngine] prompt_rewrite_func failed for req %s", request_id)
+                raise
+
         original_prompt = prompt
 
         stage_type = self.stage_metadata[0].get("stage_type")
@@ -1194,7 +1216,6 @@ class AsyncOmniEngine:
                 params=params,
                 supported_tasks=self.supported_tasks,
                 arrival_time=arrival_time,
-                lora_request=lora_request,
                 tokenization_kwargs=tokenization_kwargs,
                 trace_headers=trace_headers,
                 priority=priority,
@@ -1202,6 +1223,15 @@ class AsyncOmniEngine:
                 resumable=resumable,
             )
             _preprocess_ms = (time.perf_counter() - _t_preprocess) * 1000.0
+            if self.request_postprocess_func is not None:
+                request = self.request_postprocess_func(
+                    request=request,
+                    prompt=prompt,
+                    sampling_params=params,
+                    tokenizer=getattr(self.input_processor.renderer, "tokenizer", None),
+                    model_path=self.model,
+                    lora_request=lora_request,
+                )
             # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
             # additional_information field in the prompt.
             request = _upgrade_to_omni_request(request, prompt)
@@ -1270,6 +1300,14 @@ class AsyncOmniEngine:
                 params=companion_params,
                 supported_tasks=self.supported_tasks,
             )
+            if self.request_postprocess_func is not None:
+                request = self.request_postprocess_func(
+                    request=request,
+                    prompt=companion_prompt,
+                    sampling_params=stage0_params,
+                    tokenizer=getattr(self.input_processor, "tokenizer", None),
+                    model_path=self.model,
+                )
             request.external_req_id = cid
 
             # Registration of this companion on stage-0's output processor is

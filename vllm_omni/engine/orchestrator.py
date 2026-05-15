@@ -76,6 +76,10 @@ def build_engine_core_request_from_tokens(
         additional_information=additional_info_payload,
     )
 
+# ============================================================
+# Orchestrator internals (run inside the background thread)
+# ============================================================
+
 
 @dataclass
 class OrchestratorRequestState:
@@ -431,6 +435,7 @@ class Orchestrator:
                         idle = False
                     else:
                         try:
+                            # raw_outputs: EngineCoreOutputs for LLM stages, OmniRequestOutput for diffusion stage
                             raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
                             if raw_outputs is None:
                                 continue
@@ -787,7 +792,7 @@ class Orchestrator:
                 _t_ar2d = _time.perf_counter()
                 diffusion_prompt = next_client.custom_process_input_func(
                     source_outputs,
-                    req_state.prompt,
+                    req_state.prompt,   # raw_prompt
                     requires_multimodal_data,
                 )
                 _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
@@ -832,13 +837,21 @@ class Orchestrator:
                 diffusion_prompt = req_state.prompt
 
             if already_submitted:
-                await next_pool.submit_update(req_id, req_state, diffusion_prompt)
+                await next_pool.submit_update(
+                    req_id,
+                    req_state,
+                    diffusion_prompt,
+                    submit_kwargs={
+                        "upstream_request_output": output,
+                    },
+                )
             else:
                 await next_pool.submit_initial(
                     req_id,
                     req_state,
                     diffusion_prompt,
                     submit_kwargs={
+                        "upstream_request_output": output,
                         "kv_sender_info": self._build_kv_sender_info(
                             list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
                             request_id=req_id,

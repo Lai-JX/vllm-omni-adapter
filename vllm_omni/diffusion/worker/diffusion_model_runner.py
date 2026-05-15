@@ -78,6 +78,10 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Initialize KV cache manager for connector management
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
 
+    def update_kv_receiver_sender_info(self, sender_host: str, sender_zmq_port: int) -> bool:
+        """Inject sender info into the receiver-side KV connector."""
+        return self.kv_transfer_manager.update_receiver_sender_info(sender_host, sender_zmq_port)
+
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
         model = getattr(self.pipeline, attr_name, None)
@@ -244,12 +248,12 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
-            # The manager handles the check for need_recv_cache internally
-            self.kv_transfer_manager.receive_multi_kv_cache_distributed(
-                req,
-                cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                target_device=getattr(self.pipeline, "device", None),
-            )
+            if bool(getattr(req.sampling_params, "need_kv_receive", True)):
+                self.kv_transfer_manager.receive_multi_kv_cache_distributed(
+                    req,
+                    cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                    target_device=getattr(self.pipeline, "device", None),
+                )
 
             if req.sampling_params.generator is None and req.sampling_params.seed is not None:
                 if req.sampling_params.generator_device is not None:

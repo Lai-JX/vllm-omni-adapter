@@ -85,6 +85,7 @@ class InlineStageDiffusionClient:
         prompt: OmniPromptType,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        upstream_request_output: Any | None = None,
     ) -> None:
         logger.info(
             "[InlineStageDiffusionClient] stage-%s [rep-%s] add request: %s",
@@ -98,6 +99,7 @@ class InlineStageDiffusionClient:
                 prompt,
                 sampling_params,
                 kv_sender_info,
+                upstream_request_output,
             )
         )
         self._tasks[request_id] = task
@@ -108,6 +110,7 @@ class InlineStageDiffusionClient:
         prompt: Any,
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[str, Any] | None = None,
+        upstream_request_output: Any | None = None,
     ) -> None:
         try:
             request = OmniDiffusionRequest(
@@ -122,6 +125,7 @@ class InlineStageDiffusionClient:
             result = results[0]
             if not result.request_id:
                 result.request_id = request_id
+            result._upstream_request_output = upstream_request_output
 
             self._output_queue.put_nowait(result)
         except DiffusionRequestAbortedError as e:
@@ -143,6 +147,7 @@ class InlineStageDiffusionClient:
         prompts: list[OmniPromptType],
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[int, dict[str, Any]] | None = None,
+        upstream_request_output: Any | None = None,
     ) -> None:
         logger.info(
             "[InlineStageDiffusionClient] stage-%s [rep-%s] add batch request: %s (%d prompts)",
@@ -157,6 +162,7 @@ class InlineStageDiffusionClient:
                 prompts,
                 sampling_params,
                 kv_sender_info,
+                upstream_request_output,
             )
         )
         self._tasks[request_id] = task
@@ -167,6 +173,7 @@ class InlineStageDiffusionClient:
         prompts: list[Any],
         sampling_params: OmniDiffusionSamplingParams,
         kv_sender_info: dict[str, Any] | None = None,
+        upstream_request_output: Any | None = None,
     ) -> None:
         try:
             request = OmniDiffusionRequest(
@@ -228,6 +235,7 @@ class InlineStageDiffusionClient:
                 stage_durations=merged_durations,
                 peak_memory_mb=peak_mem,
             )
+            result._upstream_request_output = upstream_request_output
 
             self._output_queue.put_nowait(result)
         except DiffusionRequestAbortedError as e:

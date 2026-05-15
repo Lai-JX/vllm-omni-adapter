@@ -1,3 +1,4 @@
+import inspect
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -23,6 +24,11 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.engine.serialization import deserialize_additional_information
+from vllm_omni.debug.request_state_dump import (
+    RequestStateDumpTool,
+    request_dump_phase_batched,
+    request_dump_phase_initialized,
+)
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -48,6 +54,24 @@ class OmniGPUModelRunner(GPUModelRunner):
         # The Omni tensor prefix cache will be allocated
         # when we initialize the metadata builders if enabled
         self.omni_prefix_cache = None
+        self.request_state_dump_tool = RequestStateDumpTool.from_env()
+
+    def _maybe_dump_request_state(
+        self,
+        req_state: CachedRequestState,
+        *,
+        phase: str,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        if self.request_state_dump_tool is None:
+            return
+        additional_information = self.model_intermediate_buffer.get(req_state.req_id)
+        self.request_state_dump_tool.maybe_dump_request_state(
+            phase=phase,
+            req_state=req_state,
+            additional_information=additional_information,
+            extra=extra,
+        )
 
     def initialize_metadata_builders(self, kv_cache_config, kernel_block_sizes):
         """Override to fix scheduler_metadata buffer size for FA3 + CUDA graph.
@@ -412,11 +436,26 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
             if self.uses_mrope:
                 self._init_mrope_positions(req_state)
+                if req_state.mrope_positions is not None:
+                    self._update_intermediate_buffer(
+                        req_id,
+                        {
+                            "prompt_mrope_position_delta": req_state.mrope_position_delta,
+                        },
+                    )
 
             # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
             if self.uses_xdrope_dim > 0:
                 self._init_xdrope_positions(req_state)
 
+            self._maybe_dump_request_state(
+                req_state,
+                phase=request_dump_phase_initialized(),
+                extra={
+                    "uses_mrope": self.uses_mrope,
+                    "uses_xdrope_dim": self.uses_xdrope_dim,
+                },
+            )
             reqs_to_add.append(self.requests[req_id])
 
         # Update the states of the running/resumed requests.
@@ -534,6 +573,20 @@ class OmniGPUModelRunner(GPUModelRunner):
         for request in reqs_to_add:
             self.input_batch.add_request(request)
             self.input_batch.update_req_spec_token_ids(request, scheduled_spec_tokens)
+            req_index = self.input_batch.req_id_to_index.get(request.req_id)
+            if req_index is not None:
+                prompt_len = len(request.prompt_token_ids)
+                self._maybe_dump_request_state(
+                    request,
+                    phase=request_dump_phase_batched(),
+                    extra={
+                        "input_batch_req_index": req_index,
+                        "input_batch_prompt_token_ids": self.input_batch.token_ids_cpu[
+                            req_index, :prompt_len
+                        ].copy(),
+                        "input_batch_num_tokens_no_spec": int(self.input_batch.num_tokens_no_spec[req_index]),
+                    },
+                )
 
         # Condense the batched states if there are gaps left by removed requests
         self.input_batch.condense()

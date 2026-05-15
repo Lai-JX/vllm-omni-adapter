@@ -236,15 +236,17 @@ class StagePool:
         request: Any,
         *,
         prompt_text: Any = None,
+        submit_kwargs: dict[str, Any] | None = None,
     ) -> int:
         """Submit a streaming update to an already admitted request."""
         params = req_state.sampling_params_list[self.stage_id]
+        submit_kwargs = dict(submit_kwargs or {})
         replica_id = self.get_bound_replica_id(request_id)
         if replica_id is None:
             replica_id = self.select_replica_id(request_id)
 
         if self.stage_type == "diffusion":
-            await self.clients[replica_id].add_request_async(request_id, request, params)
+            await self.clients[replica_id].add_request_async(request_id, request, params, **submit_kwargs)
         else:
             # Refresh the shared output-processor state before yielding to the
             # stage client so streaming segments are merged against the latest

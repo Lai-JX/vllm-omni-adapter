@@ -38,6 +38,48 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 
+def _slice_tensor_batch(value: Any, index: int, total: int) -> Any:
+    if not isinstance(value, torch.Tensor):
+        return value
+    if value.ndim == 0 or value.shape[0] != total:
+        return value
+    return value[index:index + 1].contiguous()
+
+
+def _slice_custom_output_value(value: Any, index: int, total: int) -> Any:
+    if isinstance(value, list) and len(value) == total:
+        return value[index]
+    if isinstance(value, tuple) and len(value) == total:
+        return value[index]
+    if isinstance(value, dict):
+        return {
+            k: _slice_custom_output_value(v, index, total)
+            for k, v in value.items()
+        }
+    return _slice_tensor_batch(value, index, total)
+
+
+def _slice_tensor_batch(value: Any, index: int, total: int) -> Any:
+    if not isinstance(value, torch.Tensor):
+        return value
+    if value.ndim == 0 or value.shape[0] != total:
+        return value
+    return value[index:index + 1].contiguous()
+
+
+def _slice_custom_output_value(value: Any, index: int, total: int) -> Any:
+    if isinstance(value, list) and len(value) == total:
+        return value[index]
+    if isinstance(value, tuple) and len(value) == total:
+        return value[index]
+    if isinstance(value, dict):
+        return {
+            k: _slice_custom_output_value(v, index, total)
+            for k, v in value.items()
+        }
+    return _slice_tensor_batch(value, index, total)
+
+
 def supports_multimodal_input(od_config: OmniDiffusionConfig) -> tuple[bool, bool]:
     if od_config.diffusion_load_format == "diffusers" and (pipe_cls := od_config.diffusers_pipeline_cls) is not None:
         signature = inspect.signature(pipe_cls.__call__)
@@ -296,6 +338,7 @@ class DiffusionEngine:
             # Split images based on num_outputs_per_prompt for each request
             results = []
             output_idx = 0
+            total_prompts = len(request.prompts)
 
             for i, prompt in enumerate(request.prompts):
                 request_id = request.request_ids[i] if i < len(request.request_ids) else ""
@@ -344,6 +387,11 @@ class DiffusionEngine:
                         mm_output["audio_sample_rate"] = model_audio_sample_rate
                     if model_fps is not None:
                         mm_output["fps"] = model_fps
+                    custom_output = {
+                        k: _slice_custom_output_value(v, i, total_prompts)
+                        for k, v in (output.custom_output or {}).items()
+                    }
+                    request_latents = _slice_tensor_batch(output.trajectory_latents, i, total_prompts)
                     results.append(
                         OmniRequestOutput.from_diffusion(
                             request_id=request_id,
@@ -553,6 +601,7 @@ class DiffusionEngine:
                 height=height,
                 width=width,
                 num_inference_steps=num_inference_steps,
+                need_kv_receive=False,
                 # Keep warmup path minimal and robust across text encoders.
                 # Some models may fail when warmup implicitly triggers
                 # classifier-free guidance with an empty negative prompt.
