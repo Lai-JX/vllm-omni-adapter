@@ -236,7 +236,8 @@ class OmniKVTransferManager:
                 if not block_ids:
                     logger.warning(f"Request {req_id} has no block IDs, skipping")
                     continue
-
+                
+                t0 = time.time()
                 custom_metadata = data.get("custom_metadata")
 
                 # Extract KV cache from GPU blocks -> CPU tensors
@@ -249,6 +250,8 @@ class OmniKVTransferManager:
 
                     # Transfer to downstream stage via connector
                     self._transfer_kv_cache(kv_data, transfer_req_id)
+                    t_transfer_done = time.time()
+                    logger.info(f"[Metrics] KV Send req {transfer_req_id} time_ms={(t_transfer_done-t0)*1000.0:.2f} start={t0:.3f} now={t_transfer_done:.3f}")
 
             except Exception as e:
                 logger.error(f"Failed KV transfer for {req_id}: {e}")
@@ -436,6 +439,7 @@ class OmniKVTransferManager:
             while True:
                 # Build the full key for connector
                 full_request_id = f"omni_{from_stage}_to_{to_stage}_kv_cache_{request_id}"
+                kv_receive_start = time.time()
                 result = self.connector.get(
                     from_stage=from_stage,
                     to_stage=to_stage,
@@ -455,7 +459,9 @@ class OmniKVTransferManager:
                             for i, tensor in enumerate(cache_list):
                                 if isinstance(tensor, torch.Tensor) and tensor.device != target_device:
                                     cache_list[i] = tensor.to(target_device).contiguous()
-
+                    now = time.time()
+                    kv_receive_time = now - kv_receive_start
+                    logger.info(f"[Metrics] KV Receive req {request_id} time_ms={kv_receive_time*1000.0:.2f} start={kv_receive_start:.3f} now={now:.3f}")
                     return data, size
 
                 if time.time() - start_time > timeout:

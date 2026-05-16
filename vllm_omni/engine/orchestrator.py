@@ -408,6 +408,8 @@ class Orchestrator:
         now = _time.time()
         submit_ts = req_state.stage_submit_ts.get(stage_id, now)
         stage_gen_time_ms = (now - submit_ts) * 1000.0
+        logger.info(f"[Metrics] Stage {stage_id} req {req_id} gen_time_ms={stage_gen_time_ms:.2f} start={submit_ts:.3f} now={now:.3f}")
+
 
         num_tokens_out = count_tokens_from_outputs(request_outputs)
         num_tokens_in = 0

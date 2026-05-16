@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time as _time
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -879,6 +880,7 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
         self,
         req: OmniDiffusionRequest,
     ) -> DiffusionOutput:
+        t_forward_start = _time.time()
         if self._is_dummy_warmup(req):
             future_steps = self.default_future_steps
             dummy_xyz = torch.zeros((1, 1, future_steps, 3), dtype=torch.float32)
@@ -1004,6 +1006,9 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             pred_xyz_list.append(pred_xyz.cpu())
             pred_rot_list.append(pred_rot.cpu())
             cot_ids_list.append(cot_ids.cpu())
+        now = _time.time()
+        forward_total_ms = (now - t_forward_start) * 1000.0
+        logger.info(f"[Metrics] Stage 1 diffusion req {req_id} time_ms={forward_total_ms:.2f} start={t_forward_start:.3f} now={now:.3f}")
 
         custom_output: dict[str, Any] = {
             "pred_xyz": pred_xyz_list[0] if len(pred_xyz_list) == 1 else pred_xyz_list,
