@@ -152,6 +152,8 @@ def capture_stage1_transition_dump(base_dir: Path):
     original_vlm2trajectory = alp_stage_processors.vlm2trajectory
 
     def wrapped_vlm2trajectory(*args, **kwargs):
+        stage_outputs = alp_stage_processors._validate_stage_inputs(args[0], args[1])
+        stage0_completion_counts = [len(list(getattr(stage_output, "outputs", []) or [])) for stage_output in stage_outputs]
         trajectory_inputs = original_vlm2trajectory(*args, **kwargs)
         try:
             if trajectory_inputs:
@@ -172,6 +174,14 @@ def capture_stage1_transition_dump(base_dir: Path):
                         "stage0_output_length": info.get("stage0_output_length"),
                         "stage0_output_lengths": _to_cpu_payload(info.get("stage0_output_lengths")),
                         "stage0_num_return_sequences": info.get("stage0_num_return_sequences"),
+                        "stage0_attention_mask": _to_cpu_payload(info.get("stage0_attention_mask")),
+                        "stage0_request_outputs_len": len(stage_outputs),
+                        "stage0_completion_counts": stage0_completion_counts,
+                        "trajectory_inputs_len": len(trajectory_inputs),
+                        "trajectory_input_sample_indices": [
+                            dict((prompt or {}).get("additional_information") or {}).get("stage0_sample_index")
+                            for prompt in trajectory_inputs
+                        ],
                     },
                     dump_path,
                 )
@@ -282,6 +292,7 @@ def write_reference_stage1_transition_dump(base_dir: Path, stage0_debug: dict[st
             "stage0_prompt_length": stage0_debug.get("stage0_prompt_length"),
             "stage0_output_length": stage0_debug.get("stage0_output_length"),
             "stage0_num_return_sequences": stage0_debug.get("stage0_num_return_sequences"),
+            "stage0_attention_mask": stage0_debug.get("stage0_attention_mask"),
         },
         output_path,
     )
@@ -566,6 +577,7 @@ def run_original(
         "stage0_prompt_length": prompt_len,
         "stage0_output_length": int(stage0_output_token_ids.shape[-1]),
         "stage0_num_return_sequences": int(sequences.shape[0]),
+        "stage0_attention_mask": model_inputs["tokenized_data"]["attention_mask"].detach().cpu().contiguous(),
     }
     stage1_prompt_info = {
         **_reference_additional_information(data),

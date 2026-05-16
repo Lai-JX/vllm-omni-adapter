@@ -481,9 +481,14 @@ def initialize_diffusion_stage(
     from vllm_omni.diffusion.data import OmniDiffusionConfig
     from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 
+    engine_args = _to_dict(stage_cfg.engine_args)
+    model = _resolve_model_tokenizer_paths(model, engine_args)
+    if engine_args.get("model_class_name") is None and engine_args.get("model_arch") is not None:
+        engine_args["model_class_name"] = engine_args["model_arch"]
+
     od_config = OmniDiffusionConfig.from_kwargs(
         model=model,
-        **_to_dict(stage_cfg.engine_args),
+        **engine_args,
     )
     if metadata.cfg_kv_collect_func is not None:
         od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func

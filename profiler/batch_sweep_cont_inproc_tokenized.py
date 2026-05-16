@@ -18,6 +18,7 @@ import numpy as np
 import torch
 import yaml
 from omegaconf import OmegaConf
+from transformers import AutoConfig
 from vllm import SamplingParams
 
 OMNI = Path(__file__).resolve().parents[1]
@@ -34,7 +35,16 @@ for p in [
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from my_example2.src.inputs.alpamayo_batch import AlpamayoDataset  # noqa: E402
+from my_example2.src.inputs.alpamayo_batch import (  # noqa: E402
+    build_alpamayo_sample,
+    build_omni_additional_information,
+    build_rollout_preprocess_fn,
+    build_rollout_processor,
+    build_traj_fuser,
+    sample_to_vllm_prompt,
+    validate_local_pai_dir,
+)
+from my_example2.src.models.register_vla_models import register_vla_models  # noqa: E402
 from profiler.run_rollout_timing import _to_jsonable  # noqa: E402
 from profiler.timestamps import render_request_timeline as request_timeline  # noqa: E402
 from vllm_omni.entrypoints.async_omni import AsyncOmni  # noqa: E402
@@ -52,9 +62,9 @@ PAI_LOCAL_DIR = os.environ.get("PAI_LOCAL_DIR", DEFAULT_PAI_LOCAL_DIR)
 TRAIN_FILE = os.environ.get("TRAIN_FILE", DEFAULT_TRAIN_FILE)
 PAI_CHUNK_IDS_ENV = os.environ.get("PAI_CHUNK_IDS", "").strip()
 T0_US = int(os.environ.get("T0_US", "5100000"))
-N_UNIQUE = int(os.environ.get("N_UNIQUE", "64"))
+N_UNIQUE = int(os.environ.get("N_UNIQUE", "1"))
 N_TOTAL = int(os.environ.get("N_TOTAL", "64"))
-BS_LIST = [int(v) for v in os.environ.get("BS_LIST", "1,2,4,8").split(",") if v.strip()]
+BS_LIST = [int(v) for v in os.environ.get("BS_LIST", "8").split(",") if v.strip()]
 MAX_REQ_PER_GROUP = int(os.environ.get("MAX_REQ_PER_GROUP", "24"))
 CHUNK_SAMPLES = int(os.environ.get("CHUNK_SAMPLES", "16"))
 SVC_YAML = OMNI / "profiler" / "alpamayo1_5_gpu0.yaml"
@@ -63,12 +73,15 @@ PROFILE_STAGES_ENV = os.environ.get("PROFILE_STAGES", "0,1").strip()
 GPU_RECOVERY_POLL_S = float(os.environ.get("GPU_RECOVERY_POLL_S", "2.0"))
 GPU_RECOVERY_TIMEOUT_S = float(os.environ.get("GPU_RECOVERY_TIMEOUT_S", "180.0"))
 GPU_RECOVERY_MARGIN_GB = float(os.environ.get("GPU_RECOVERY_MARGIN_GB", "1.0"))
+GENERATE_TRAJ_TOKENS_ENV = os.environ.get("GENERATE_TRAJ_TOKENS", "0").strip()
 
 LOG_DIR = OMNI / "profiler" / "logs" / str(N_TOTAL) / f"async_omni_inproc_tokenized_trace-gid{PROFILE_GID_ENV}_{int(time.time())}"
 ASYNC_OMNI_LOG_DIR = LOG_DIR / "svc_logs"
 OUT = LOG_DIR / "metrics" / "batch_results.md"
 PROFILE_DIR = LOG_DIR / "torch_traces"
 RUNTIME_SVC_YAML = LOG_DIR / SVC_YAML.name
+TOKENIZED_STAGE0_TRAJ_START_TOKEN_ID = 155681
+TOKENIZED_STAGE0_TRAJ_END_TOKEN_ID = 155683
 
 KV_TIMING_RE = re.compile(
     r"KV transfer timing: req=(?P<req>\S+) "
@@ -115,6 +128,18 @@ def _parse_chunk_ids():
     return [chunk_id.strip() for chunk_id in PAI_CHUNK_IDS_ENV.split(",") if chunk_id.strip()]
 
 
+def _parse_bool_flag(raw_value: str, *, name: str, default: bool) -> bool:
+    if not raw_value:
+        return default
+
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Invalid {name} value: {raw_value!r}")
+
+
 def _build_dataset_config() -> Any:
     return OmegaConf.create(
         {
@@ -132,30 +157,92 @@ def _build_dataset_config() -> Any:
     )
 
 
+def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        return config.get(key, default)
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        try:
+            return getter(key, default)
+        except TypeError:
+            pass
+    return getattr(config, key, default)
+
+
+def _cfg_select(config: Any, path: str, default: Any = None) -> Any:
+    cur = config
+    for part in path.split("."):
+        cur = _cfg_get(cur, part, None)
+        if cur is None:
+            return default
+    return cur
+
+
+def _build_local_pai_interface(local_dir: str, chunk_ids: Any | None = None) -> Any:
+    from alpamayo_r1.data.pai_utils import PhysicalAIAVDatasetLocalInterface
+
+    return PhysicalAIAVDatasetLocalInterface(local_dir=local_dir, chunk_ids=chunk_ids)
+
+
 def _build_runtime_stage_config(
     source_stage_config_path: Path = SVC_YAML,
     runtime_stage_config_path: Path = RUNTIME_SVC_YAML,
     profile_dir: Path = PROFILE_DIR,
+    apply_tokenized_stage0_overrides: bool = True,
 ) -> Path:
     profile_dir = Path(profile_dir)
     profile_dir.mkdir(parents=True, exist_ok=True)
     runtime_stage_config_path.parent.mkdir(parents=True, exist_ok=True)
 
-    config_text = source_stage_config_path.read_text(encoding="utf-8")
-    updated_text, replacements = re.subn(
-        r"^(\s*torch_profiler_dir:\s*).*$",
-        rf"\1{profile_dir}",
-        config_text,
-        flags=re.MULTILINE,
-    )
+    yaml_config = yaml.safe_load(source_stage_config_path.read_text(encoding="utf-8"))
+    stage_args = yaml_config.get("stage_args") or []
+    replacements = 0
+
+    for stage_config in stage_args:
+        if stage_config.get("stage_id") == 0:
+            stage_config.pop("renderer_rewrite_func", None)
+            stage_config.pop("prompt_rewrite_func", None)
+            if apply_tokenized_stage0_overrides:
+                _apply_tokenized_stage0_overrides(stage_config)
+
+        engine_args = stage_config.get("engine_args") or {}
+        profiler_config = engine_args.get("profiler_config") or {}
+        if "torch_profiler_dir" not in profiler_config:
+            continue
+        profiler_config["torch_profiler_dir"] = str(profile_dir)
+        replacements += 1
+
     if replacements == 0:
-        raise RuntimeError(f"No torch_profiler_dir entries found in {source_stage_config_path}")
-    runtime_stage_config_path.write_text(updated_text, encoding="utf-8")
+        raise RuntimeError(
+            f"No torch_profiler_dir entries found in stage_args engine_args profiler_config of "
+            f"{source_stage_config_path}"
+        )
+
+    runtime_stage_config_path.write_text(
+        yaml.safe_dump(yaml_config, sort_keys=False),
+        encoding="utf-8",
+    )
     print(
         f"  Wrote runtime stage config {runtime_stage_config_path} "
-        f"(torch_profiler_dir -> {profile_dir})"
+        f"(torch_profiler_dir -> {profile_dir}, "
+        f"tokenized_stage0_overrides={'on' if apply_tokenized_stage0_overrides else 'off'})"
     )
     return runtime_stage_config_path
+
+
+def _apply_tokenized_stage0_overrides(stage_config: dict[str, Any]) -> None:
+    engine_args = stage_config.setdefault("engine_args", {})
+    engine_args.pop("logits_processors", None)
+
+    omni_kv_config = engine_args.setdefault("omni_kv_config", {})
+    kv_transfer_criteria = omni_kv_config.setdefault("kv_transfer_criteria", {})
+    kv_transfer_criteria["type"] = "next_step_after_special_token"
+    kv_transfer_criteria["token_id"] = TOKENIZED_STAGE0_TRAJ_START_TOKEN_ID
+
+    default_sampling_params = stage_config.setdefault("default_sampling_params", {})
+    default_sampling_params["stop_token_ids"] = [TOKENIZED_STAGE0_TRAJ_END_TOKEN_ID]
 
 
 @contextmanager
@@ -676,26 +763,77 @@ async def _wait_for_gpu_recovery(*, expected_free_bytes, bs):
         await asyncio.sleep(GPU_RECOVERY_POLL_S)
 
 
-def _build_dataset() -> AlpamayoDataset:
+def _build_model_input_components() -> dict[str, Any]:
+    register_vla_models()
+    # Importing the original Alpamayo model module registers
+    # model_type="alpamayo1_5" with Hugging Face AutoConfig.
+    import alpamayo1_5.models.alpamayo1_5  # noqa: F401
+
     config = _build_dataset_config()
-    return AlpamayoDataset(
-        data_files=TRAIN_FILE,
-        tokenizer=None,
-        processor=None,
-        config=config,
-        max_samples=0,
+    model_path = (
+        _cfg_select(config, "actor_rollout_ref.model.path")
+        or _cfg_select(config, "model.path")
+        or _cfg_get(config, "model_path")
+        or _cfg_get(config, "path")
     )
+    if model_path is None:
+        raise ValueError("model path is required to build tokenized Alpamayo inputs.")
+
+    validate_local_pai_dir(PAI_LOCAL_DIR)
+    model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    processor = build_rollout_processor(model_config)
+    preprocess_fn = build_rollout_preprocess_fn(model_config)
+    traj_fuser = build_traj_fuser(model_config)
+    avdi = _build_local_pai_interface(PAI_LOCAL_DIR, _parse_chunk_ids())
+    return {
+        "config": config,
+        "model_config": model_config,
+        "processor": processor,
+        "preprocess_fn": preprocess_fn,
+        "traj_fuser": traj_fuser,
+        "avdi": avdi,
+    }
+
+
+def _build_model_input(
+    *,
+    clip_id: str,
+    t0_us: int,
+    preprocess_fn: Any,
+    processor: Any,
+    model_config: Any,
+    traj_fuser: Any,
+    avdi: Any,
+) -> dict[str, Any]:
+    sample = build_alpamayo_sample(clip_id, t0_us, preprocess_fn, avdi)
+    prompt = sample_to_vllm_prompt(sample, processor.tokenizer, model_config, traj_fuser)
+    if "additional_information" not in prompt:
+        sample_with_cfg = dict(sample)
+        sample_with_cfg["model_config"] = model_config
+        postprocess_prompt_ids = list(prompt.get("postprocess_prompt_token_ids") or prompt.get("prompt_token_ids") or [])
+        prompt["additional_information"] = build_omni_additional_information(
+            sample_with_cfg,
+            postprocess_prompt_ids=postprocess_prompt_ids,
+        )
+    return prompt
 
 
 async def main_async():
     print(f"Batch sweep: {N_TOTAL} samples ({N_UNIQUE} unique clips cycled), BS={BS_LIST}")
-    _build_runtime_stage_config()
+    apply_tokenized_stage0_overrides = _parse_bool_flag(
+        GENERATE_TRAJ_TOKENS_ENV,
+        name="GENERATE_TRAJ_TOKENS",
+        default=True,
+    )
+    _build_runtime_stage_config(
+        apply_tokenized_stage0_overrides=apply_tokenized_stage0_overrides,
+    )
     tokenizer = build_alpamayo_stage0_tokenizer(MODEL)
     sampling_params_list = _load_sampling_params_from_yaml(tokenizer)
 
     print("Loading dataset + preparing tokenized inputs...")
-    dataset = _build_dataset()
-    avdi = dataset.avdi
+    components = _build_model_input_components()
+    avdi = components["avdi"]
     ci = avdi.clip_index
     print(len(list(ci[ci.chunk == 3116].index)))
     unique_cids = list(ci[ci.chunk == 3116].index)[:N_UNIQUE]
@@ -704,7 +842,15 @@ async def main_async():
     build_ms_list = []
     for i, cid in enumerate(unique_cids):
         t_build = time.perf_counter()
-        model_input = dataset.build_model_input(str(cid), T0_US)
+        model_input = _build_model_input(
+            clip_id=str(cid),
+            t0_us=T0_US,
+            preprocess_fn=components["preprocess_fn"],
+            processor=components["processor"],
+            model_config=components["model_config"],
+            traj_fuser=components["traj_fuser"],
+            avdi=components["avdi"],
+        )
         build_ms = (time.perf_counter() - t_build) * 1000.0
         samples_unique.append(
             {

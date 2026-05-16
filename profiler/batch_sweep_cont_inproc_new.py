@@ -42,9 +42,9 @@ from vllm_omni.model_executor.stage_input_processors.alpamayo1_5 import (  # noq
 DEFAULT_MODEL_PATH = "/share/models/Alpamayo-1.5-10B"
 MODEL = os.environ.get("MODEL_PATH", str(DEFAULT_MODEL_PATH))
 T0_US = int(os.environ.get("T0_US", "5100000"))
-N_UNIQUE = int(os.environ.get("N_UNIQUE", "64"))
-N_TOTAL = int(os.environ.get("N_TOTAL", "64"))
-BS_LIST = [int(v) for v in os.environ.get("BS_LIST", "1,2,4,8").split(",") if v.strip()]
+N_UNIQUE = int(os.environ.get("N_UNIQUE", "1"))
+N_TOTAL = int(os.environ.get("N_TOTAL", "1"))
+BS_LIST = [int(v) for v in os.environ.get("BS_LIST", "1").split(",") if v.strip()]
 MAX_REQ_PER_GROUP = int(os.environ.get("MAX_REQ_PER_GROUP", "24"))
 CHUNK_SAMPLES = int(os.environ.get("CHUNK_SAMPLES", "16"))
 SVC_YAML = OMNI / "profiler" / "alpamayo1_5_gpu0.yaml"

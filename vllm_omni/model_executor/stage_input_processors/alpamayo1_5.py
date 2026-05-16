@@ -570,58 +570,53 @@ def vlm2trajectory(
 
         prompt_token_ids = list(stage_output.prompt_token_ids or [])
         output_token_ids_list = [list(output.token_ids or []) for output in outputs]
-        if len(output_token_ids_list) == 1:
-            output_token_ids_payload: list[int] | list[list[int]] = output_token_ids_list[0]
-            full_sequence: list[int] | list[list[int]] = prompt_token_ids + output_token_ids_list[0]
-        else:
-            output_token_ids_payload = output_token_ids_list
-            full_sequence = [prompt_token_ids + output_token_ids for output_token_ids in output_token_ids_list]
+        total_stage0_samples = len(output_token_ids_list)
 
-        transformed_info = dict(original_additional_information)
-        tokenized_data = dict(transformed_info.get("tokenized_data") or {})
-        tokenized_data["input_ids"] = full_sequence
-        transformed_info["tokenized_data"] = tokenized_data
-        transformed_info["stage0_prompt_token_ids"] = prompt_token_ids
-        transformed_info["stage0_output_token_ids"] = output_token_ids_payload
-        transformed_info["stage0_sequences"] = full_sequence
-        transformed_info["stage0_prompt_length"] = len(prompt_token_ids)
-        if len(output_token_ids_list) == 1:
-            transformed_info["stage0_output_length"] = len(output_token_ids_list[0])
-        else:
-            transformed_info["stage0_output_lengths"] = [len(output_token_ids) for output_token_ids in output_token_ids_list]
-        transformed_info["stage0_num_return_sequences"] = len(output_token_ids_list)
-        transformed_info["num_return_sequences"] = max(
-            int(transformed_info.get("num_return_sequences", 1) or 1),
-            len(output_token_ids_list),
-        )
+        for sample_idx, (output, output_token_ids) in enumerate(zip(outputs, output_token_ids_list, strict=False)):
+            full_sequence = prompt_token_ids + output_token_ids
 
-        multimodal_output = getattr(outputs[0], "multimodal_output", None) or {}
-        latent = multimodal_output.get("latent")
-        if isinstance(latent, torch.Tensor):
-            transformed_info["stage0_latent"] = latent.detach().cpu().to(torch.float32).contiguous()
-            transformed_info["stage0_latent_shape"] = list(latent.shape)
-        prompt_mrope_position_delta = multimodal_output.get("prompt_mrope_position_delta")
-        # initial_noise_x0 = multimodal_output.get("initial_noise_x0")
-        # if isinstance(initial_noise_x0, torch.Tensor):
-        #     transformed_info["initial_noise_x0"] = initial_noise_x0.detach().cpu().contiguous()
-        # for key in ("rope_deltas", "attention_mask"):
-        #     value = multimodal_output.get(key)
-        #     if isinstance(value, torch.Tensor):
-        #         transformed_info[f"stage0_{key}"] = value.detach().cpu().contiguous()
-
-        _populate_missing_stage0_fields(
-            transformed_info,
-            prompt_token_ids=prompt_token_ids,
-            output_token_ids_list=output_token_ids_list,
-            prompt_mrope_position_delta=prompt_mrope_position_delta,
-        )
-        # logger.info(f"vlm2trajectory transformed additional_information {transformed_info}" )
-
-        trajectory_inputs.append(
-            OmniTextPrompt(
-                prompt="",
-                additional_information=transformed_info,
+            transformed_info = dict(original_additional_information)
+            tokenized_data = dict(transformed_info.get("tokenized_data") or {})
+            tokenized_data["input_ids"] = full_sequence
+            transformed_info["tokenized_data"] = tokenized_data
+            transformed_info["stage0_prompt_token_ids"] = prompt_token_ids
+            transformed_info["stage0_output_token_ids"] = output_token_ids
+            transformed_info["stage0_sequences"] = full_sequence
+            transformed_info["stage0_prompt_length"] = len(prompt_token_ids)
+            transformed_info["stage0_output_length"] = len(output_token_ids)
+            transformed_info["stage0_num_return_sequences"] = total_stage0_samples
+            transformed_info["stage0_sample_index"] = sample_idx
+            transformed_info.setdefault(
+                "num_return_sequences",
+                int(original_additional_information.get("num_return_sequences", 1) or 1),
             )
-        )
+
+            multimodal_output = getattr(output, "multimodal_output", None) or {}
+            latent = multimodal_output.get("latent")
+            if isinstance(latent, torch.Tensor):
+                transformed_info["stage0_latent"] = latent.detach().cpu().to(torch.float32).contiguous()
+                transformed_info["stage0_latent_shape"] = list(latent.shape)
+            prompt_mrope_position_delta = multimodal_output.get("prompt_mrope_position_delta")
+            initial_noise_x0 = multimodal_output.get("initial_noise_x0")
+            if isinstance(initial_noise_x0, torch.Tensor):
+                transformed_info["initial_noise_x0"] = initial_noise_x0.detach().cpu().contiguous()
+            for key in ("rope_deltas", "attention_mask"):
+                value = multimodal_output.get(key)
+                if isinstance(value, torch.Tensor):
+                    transformed_info[f"stage0_{key}"] = value.detach().cpu().contiguous()
+
+            _populate_missing_stage0_fields(
+                transformed_info,
+                prompt_token_ids=prompt_token_ids,
+                output_token_ids_list=[output_token_ids],
+                prompt_mrope_position_delta=prompt_mrope_position_delta,
+            )
+
+            trajectory_inputs.append(
+                OmniTextPrompt(
+                    prompt="",
+                    additional_information=transformed_info,
+                )
+            )
 
     return trajectory_inputs

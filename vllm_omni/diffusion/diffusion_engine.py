@@ -26,6 +26,27 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 
+def _slice_tensor_batch(value: Any, index: int, total: int) -> Any:
+    if not isinstance(value, torch.Tensor):
+        return value
+    if value.ndim == 0 or value.shape[0] != total:
+        return value
+    return value[index:index + 1].contiguous()
+
+
+def _slice_custom_output_value(value: Any, index: int, total: int) -> Any:
+    if isinstance(value, list) and len(value) == total:
+        return value[index]
+    if isinstance(value, tuple) and len(value) == total:
+        return value[index]
+    if isinstance(value, dict):
+        return {
+            k: _slice_custom_output_value(v, index, total)
+            for k, v in value.items()
+        }
+    return _slice_tensor_batch(value, index, total)
+
+
 def supports_image_input(model_class_name: str) -> bool:
     model_cls = DiffusionModelRegistry._try_load_model_cls(model_class_name)
     if model_cls is None:
@@ -204,6 +225,7 @@ class DiffusionEngine:
             # Split images based on num_outputs_per_prompt for each request
             results = []
             output_idx = 0
+            total_prompts = len(request.prompts)
 
             for i, prompt in enumerate(request.prompts):
                 request_id = request.request_ids[i] if i < len(request.request_ids) else ""
@@ -244,14 +266,19 @@ class DiffusionEngine:
                                 if num_outputs == 1:
                                     sliced_audio = sliced_audio[0]
                         mm_output["audio"] = sliced_audio
+                    custom_output = {
+                        k: _slice_custom_output_value(v, i, total_prompts)
+                        for k, v in (output.custom_output or {}).items()
+                    }
+                    request_latents = _slice_tensor_batch(output.trajectory_latents, i, total_prompts)
                     results.append(
                         OmniRequestOutput.from_diffusion(
                             request_id=request_id,
                             images=request_outputs,
                             prompt=prompt,
                             metrics=metrics,
-                            latents=output.trajectory_latents,
-                            custom_output=output.custom_output or {},
+                            latents=request_latents,
+                            custom_output=custom_output,
                             multimodal_output=mm_output,
                             stage_durations=output.stage_durations,
                             peak_memory_mb=output.peak_memory_mb,
