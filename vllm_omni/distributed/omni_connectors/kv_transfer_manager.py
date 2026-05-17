@@ -797,7 +797,8 @@ class OmniKVTransferManager:
                 if not block_ids:
                     logger.warning(f"Request {req_id} has no block IDs, skipping")
                     continue
-
+                
+                t0 = time.time()
                 custom_metadata = data.get("custom_metadata")
 
                 # Extract KV cache from GPU blocks and keep it on-device when
@@ -811,6 +812,8 @@ class OmniKVTransferManager:
 
                     # Transfer to downstream stage via connector
                     self._transfer_kv_cache(kv_data, transfer_req_id)
+                    t_transfer_done = time.time()
+                    logger.info(f"[Metrics] KV Send req {transfer_req_id} time_ms={(t_transfer_done-t0)*1000.0:.2f} start={t0:.3f} now={t_transfer_done:.3f}")
 
             except Exception as e:
                 logger.error(f"Failed KV transfer for {req_id}: {e}")
@@ -1054,6 +1057,7 @@ class OmniKVTransferManager:
         try:
             while True:
                 link_start = time.perf_counter()
+                kv_receive_start = time.time()
                 for get_key, from_rank in list(pending_pairs):
                     # Construct per-rank metadata so the connector queries
                     # the correct sender endpoint (heterogeneous TP path).
@@ -1141,6 +1145,9 @@ class OmniKVTransferManager:
                         elapsed,
                         link_ms,
                     )
+                    now = time.time()
+                    kv_receive_time = now - kv_receive_start
+                    logger.info(f"[Metrics] KV Receive req {request_id} time_ms={kv_receive_time*1000.0:.2f} start={kv_receive_start:.3f} now={now:.3f}")
                     return data, total_size
 
                 if time.time() - start_time > timeout:

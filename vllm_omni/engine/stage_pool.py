@@ -137,6 +137,7 @@ class StagePool:
         """Build stage metrics for outputs produced on one replica."""
         now = _time.time()
         stage_gen_time_ms = (now - submit_ts) * 1000.0
+        logger.info(f"[Metrics] Stage {self.stage_id} req {request_outputs[0].request_id} gen_time_ms={stage_gen_time_ms:.2f} start={submit_ts:.3f} now={now:.3f}")
 
         num_tokens_out = count_tokens_from_outputs(request_outputs)
         num_tokens_in = 0
