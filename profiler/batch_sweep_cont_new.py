@@ -330,13 +330,13 @@ def _render_timeline_html_for_log(log_path: Path, bs: int) -> Path | None:
         return None
 
     try:
-        order, rows = request_timeline.parse_log(log_path)
+        order, rows, profiles = request_timeline.parse_log(log_path)
         batch_size = request_timeline.infer_batch_size(log_path)
         if batch_size is None:
             batch_size = request_timeline.infer_batch_size_from_requests(order)
         if batch_size is None:
             batch_size = bs
-        payload = request_timeline.build_requests_payload(order, rows, batch_size)
+        payload = request_timeline.build_requests_payload(order, rows, batch_size, profiles)
         if not payload["requests"]:
             print(f"  timeline skip: no request metrics found in {log_path.name}")
             return None
@@ -347,7 +347,6 @@ def _render_timeline_html_for_log(log_path: Path, bs: int) -> Path | None:
     except Exception as exc:
         print(f"  timeline render failed for {log_path.name}: {exc!r}")
         return None
-        grp["agg"] = _build_group_agg(grp.get("reqs", []), grp["agg"]["wall_ms"])
 
 
 def _build_result_from_response(resp, cid, rid, lat, client_timings=None):

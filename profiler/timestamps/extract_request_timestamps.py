@@ -54,18 +54,54 @@ PATTERNS = [
 ]
 
 PHASES = ["stage0", "kv_send", "kv_recv", "diffusion", "stage1"]
+STAGE0_PROFILE_PATTERN = re.compile(r"\[Stage0Profile\]\s+(\{.*\})")
+STAGE0_PROFILE_FIELDS = [
+    "prompt_tokens",
+    "output_tokens",
+    "scheduled_tokens",
+    "batch_size",
+    "batch_total_scheduled_tokens",
+    "embed_multimodal_ms",
+    "forward_ms",
+]
 BS_PATTERNS = [
     re.compile(r"(?:^|[_-])bs[_-]?(\d+)(?:\D|$)", re.IGNORECASE),
     re.compile(r"\bbs(\d+)\b", re.IGNORECASE),
 ]
 
 
-def parse_log(path: Path) -> tuple[list[str], dict[str, dict[str, dict[str, str]]]]:
+def parse_log(path: Path) -> tuple[list[str], dict[str, dict[str, dict[str, str]]], dict[str, dict[str, str]]]:
     rows: dict[str, dict[str, dict[str, str]]] = defaultdict(dict)
     order: list[str] = []
+    profiles: dict[str, dict[str, str]] = {}
 
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
+            profile_match = STAGE0_PROFILE_PATTERN.search(line)
+            if profile_match:
+                try:
+                    payload = json.loads(profile_match.group(1))
+                except json.JSONDecodeError:
+                    payload = None
+                if isinstance(payload, dict):
+                    req_id = payload.get("request_id")
+                    if isinstance(req_id, str) and req_id:
+                        if req_id not in rows:
+                            order.append(req_id)
+                        profile_data = {
+                            key: str(payload.get(key, ""))
+                            for key in STAGE0_PROFILE_FIELDS
+                        }
+                        start_ts = payload.get("start")
+                        now_ts = payload.get("now")
+                        if start_ts is not None and now_ts is not None:
+                            rows[req_id]["stage0_profile"] = {
+                                "time_ms": str(payload.get("embed_multimodal_ms", "") or ""),
+                                "start": str(start_ts),
+                                "now": str(now_ts),
+                            }
+                        profiles[req_id] = profile_data
+                continue
             for phase, pattern, duration_key in PATTERNS:
                 match = pattern.search(line)
                 if not match:
@@ -80,7 +116,7 @@ def parse_log(path: Path) -> tuple[list[str], dict[str, dict[str, dict[str, str]
                 }
                 break
 
-    return order, rows
+    return order, rows, profiles
 
 
 def infer_batch_size(path: Path) -> int | None:
@@ -95,7 +131,10 @@ def infer_batch_size(path: Path) -> int | None:
 
 
 def build_table(
-    order: list[str], rows: dict[str, dict[str, dict[str, str]]], batch_size: int | None
+    order: list[str],
+    rows: dict[str, dict[str, dict[str, str]]],
+    batch_size: int | None,
+    profiles: dict[str, dict[str, str]],
 ) -> list[dict[str, str]]:
     table: list[dict[str, str]] = []
     for index, req_id in enumerate(order):
@@ -111,6 +150,8 @@ def build_table(
             row[f"{phase}_ms"] = phase_data.get("gen_time_ms", "") or phase_data.get(
                 "time_ms", ""
             )
+        for key in STAGE0_PROFILE_FIELDS:
+            row[key] = profiles.get(req_id, {}).get(key, "")
         table.append(row)
     return table
 
@@ -187,8 +228,8 @@ def main() -> int:
     if batch_size is not None and batch_size <= 0:
         parser.error(f"batch size must be positive, got: {batch_size}")
 
-    order, rows = parse_log(args.logfile)
-    table = build_table(order, rows, batch_size)
+    order, rows, profiles = parse_log(args.logfile)
+    table = build_table(order, rows, batch_size, profiles)
 
     if args.format == "pretty":
         if args.output:

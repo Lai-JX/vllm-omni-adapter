@@ -341,10 +341,12 @@ class Orchestrator:
         Control flow: poll raw → process through output processor → route.
         """
         while not self._shutdown_event.is_set():
+            loop_start_ts = _time.time()
             idle = True
             for stage_id in range(self.num_stages):
                 if self._shutdown_event.is_set():
                     return
+                stage_loop_start_ts = _time.time()
 
                 # 1) Diffusion stage: poll non-blocking queue
                 # TODO (Peiqi): the output of diffusion stage is OmniRequestOutput,
@@ -352,20 +354,86 @@ class Orchestrator:
                 # the output format in the future to simplify the processing logic in Orchestrator.
                 stage_client = self.stage_clients[stage_id]
                 if stage_client.stage_type == "diffusion":
+                    diffusion_poll_start_ts = _time.time()
                     output = stage_client.get_diffusion_output_async()
+                    diffusion_poll_now = _time.time()
+                    diffusion_poll_ms = (diffusion_poll_now - diffusion_poll_start_ts) * 1000.0
+                    if diffusion_poll_ms > 10.0:
+                        logger.info(
+                            "[Metrics] Orchestrator stage %s diffusion_poll_ms=%.2f start=%.3f now=%.3f",
+                            stage_id,
+                            diffusion_poll_ms,
+                            diffusion_poll_start_ts,
+                            diffusion_poll_now,
+                        )
                     if output is not None:
                         idle = False
+                        dequeue_ts = _time.time()
+                        queue_put_ts = getattr(output, "diffusion_queue_put_ts", None)
+                        queue_wait_ms = (dequeue_ts - queue_put_ts) * 1000.0 if queue_put_ts is not None else None
+                        if queue_put_ts is not None and queue_wait_ms > 10.0:
+                            logger.info(
+                                "[Metrics] Stage %s diffusion dequeue req %s queue_wait_ms=%.2f start=%.3f now=%.3f",
+                                stage_id,
+                                output.request_id,
+                                queue_wait_ms,
+                                queue_put_ts,
+                                dequeue_ts,
+                            )
                         req_state = self.request_states.get(output.request_id)
                         if req_state is not None:
+                            stage_metrics_build_start_ts = _time.time()
                             stage_metrics = self._build_stage_metrics(stage_id, output.request_id, [output], req_state)
+                            stage_metrics_build_now = _time.time()
+                            metrics_build_ms = (stage_metrics_build_now - stage_metrics_build_start_ts) * 1000.0
+                            if metrics_build_ms > 10.0:
+                                logger.info(
+                                    "[Metrics] Orchestrator stage %s metrics_build_ms=%.2f start=%.3f now=%.3f",
+                                    stage_id,
+                                    metrics_build_ms,
+                                    stage_metrics_build_start_ts,
+                                    stage_metrics_build_now,
+                                )
+                            route_start_ts = _time.time()
                             await self._route_output(stage_id, output, req_state, stage_metrics)
+                            route_now = _time.time()
+                            route_ms = (route_now - route_start_ts) * 1000.0
+                            if route_ms > 10.0:
+                                logger.info(
+                                    "[Metrics] Orchestrator stage %s route_output_ms=%.2f start=%.3f now=%.3f",
+                                    stage_id,
+                                    route_ms,
+                                    route_start_ts,
+                                    route_now,
+                                )
+                    stage_loop_now = _time.time()
+                    total_ms = (stage_loop_now - stage_loop_start_ts) * 1000.0
+                    if total_ms > 10.0:
+                        logger.info(
+                            "[Metrics] Orchestrator loop stage %s total_ms=%.2f start=%.3f now=%.3f",
+                            stage_id,
+                            total_ms,
+                            stage_loop_start_ts,
+                            stage_loop_now,
+                        )
                     continue
 
                 # 1) Poll raw outputs from the stage
+                poll_start_ts = _time.time()
                 try:
                     # raw_outputs: EngineCoreOutputs for LLM stages, OmniRequestOutput for diffusion stage
                     raw_outputs = await asyncio.wait_for(self._poll_stage_raw(stage_id), timeout=0.001)
                 except asyncio.TimeoutError:
+                    poll_now = _time.time()
+                    poll_timeout_ms = (poll_now - poll_start_ts) * 1000.0 if poll_start_ts is not None else 0
+                    if poll_timeout_ms > 10.0:
+                        logger.info(
+                            "[Metrics] Orchestrator stage %s poll_timeout_ms=%.2f start=%.3f now=%.3f",
+                            stage_id,
+                            poll_timeout_ms,
+                            poll_start_ts,
+                            poll_now,
+                        )
                     continue
                 except asyncio.CancelledError:
                     raise
@@ -377,13 +445,44 @@ class Orchestrator:
                         stage_id,
                     )
                     raise
+                poll_now = _time.time()
+                poll_ms = (poll_now - poll_start_ts) * 1000.0
+                if poll_ms > 10.0:
+                    logger.info(
+                        "[Metrics] Orchestrator stage %s poll_raw_ms=%.2f start=%.3f now=%.3f",
+                        stage_id,
+                        poll_ms,
+                        poll_start_ts,
+                    poll_now,
+                )
 
                 if raw_outputs is None:
+                    stage_loop_now = _time.time()
+                    total_ms = (stage_loop_now - stage_loop_start_ts) * 1000.0
+                    if total_ms > 10.0:
+                        logger.info(
+                            "[Metrics] Orchestrator loop stage %s total_ms=%.2f start=%.3f now=%.3f",
+                            stage_id,
+                            total_ms,
+                            stage_loop_start_ts,
+                        stage_loop_now,
+                    )
                     continue
                 idle = False
 
                 # 2) Process raw outputs through the output processor
+                process_start_ts = _time.time()
                 request_outputs = await self._process_stage_outputs(stage_id, raw_outputs)
+                process_now = _time.time()
+                process_ms = (process_now - process_start_ts) * 1000.0
+                if process_ms > 10.0:
+                    logger.info(
+                        "[Metrics] Orchestrator stage %s process_outputs_ms=%.2f start=%.3f now=%.3f",
+                        stage_id,
+                        process_ms,
+                        process_start_ts,
+                        process_now,
+                    )
 
                 # 3) Route each processed output
                 for output in request_outputs:
@@ -398,18 +497,59 @@ class Orchestrator:
                         continue
                     stage_metrics = None
                     if output.finished:
+                        stage_metrics_build_start_ts = _time.time()
                         stage_metrics = self._build_stage_metrics(
                             stage_id,
                             output.request_id,
                             [output],
                             req_state,
                         )
+                        stage_metrics_build_now = _time.time()
+                        logger.info(
+                            "[Metrics] Orchestrator stage %s metrics_build_ms=%.2f start=%.3f now=%.3f",
+                            stage_id,
+                            (stage_metrics_build_now - stage_metrics_build_start_ts) * 1000.0,
+                            stage_metrics_build_start_ts,
+                            stage_metrics_build_now,
+                        )
+                    route_start_ts = _time.time()
                     await self._route_output(stage_id, output, req_state, stage_metrics)
+                    route_now = _time.time()
+                    route_ms = (route_now - route_start_ts) * 1000.0
+                    if route_ms > 10.0:
+                        logger.info(
+                            "[Metrics] Orchestrator stage %s route_output_ms=%.2f start=%.3f now=%.3f",
+                            stage_id,
+                            route_ms,
+                            route_start_ts,
+                            route_now,
+                        )
+
+                stage_loop_now = _time.time()
+                total_ms = (stage_loop_now - stage_loop_start_ts) * 1000.0
+                if total_ms > 10.0:
+                    logger.info(
+                        "[Metrics] Orchestrator loop stage %s total_ms=%.2f start=%.3f now=%.3f",
+                        stage_id,
+                        total_ms,
+                        stage_loop_start_ts,
+                        stage_loop_now,
+                    )
 
             if idle:
                 await asyncio.sleep(0.001)
             else:
                 await asyncio.sleep(0)
+            loop_now = _time.time()
+            loop_ms = (loop_now - loop_start_ts) * 1000.0
+            if loop_ms > 10.0:
+                logger.info(
+                    "[Metrics] Orchestrator loop total_ms=%.2f idle=%s start=%.3f now=%.3f",
+                    loop_ms,
+                    idle,
+                loop_start_ts,
+                loop_now,
+            )
 
     async def _route_output(
         self,

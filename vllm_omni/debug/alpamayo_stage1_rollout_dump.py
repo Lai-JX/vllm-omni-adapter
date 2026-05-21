@@ -139,7 +139,24 @@ class AlpamayoStage1DumpTool:
             return None
 
 
-_TOOL = AlpamayoStage1DumpTool.from_env()
+_ENV_NAMES = (
+    "VLLM_OMNI_ALPAMAYO_STAGE1_DUMP_DIR",
+    "VLLM_OMNI_ALPAMAYO_STAGE1_DUMP_REQ_IDS",
+    "VLLM_OMNI_ALPAMAYO_STAGE1_DUMP_PHASES",
+)
+_TOOL: AlpamayoStage1DumpTool | None = None
+_TOOL_ENV_SNAPSHOT: tuple[str | None, ...] | None = None
+
+
+def _get_tool() -> AlpamayoStage1DumpTool | None:
+    global _TOOL
+    global _TOOL_ENV_SNAPSHOT
+
+    env_snapshot = tuple(os.environ.get(name) for name in _ENV_NAMES)
+    if env_snapshot != _TOOL_ENV_SNAPSHOT:
+        _TOOL_ENV_SNAPSHOT = env_snapshot
+        _TOOL = AlpamayoStage1DumpTool.from_env()
+    return _TOOL
 
 
 def maybe_dump_alpamayo_stage1_rollout(
@@ -148,6 +165,7 @@ def maybe_dump_alpamayo_stage1_rollout(
     phase: str,
     payload: dict[str, Any],
 ) -> Path | None:
-    if _TOOL is None:
+    tool = _get_tool()
+    if tool is None:
         return None
-    return _TOOL.maybe_dump(req_id=req_id, phase=phase, payload=payload)
+    return tool.maybe_dump(req_id=req_id, phase=phase, payload=payload)

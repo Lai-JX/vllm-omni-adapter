@@ -6,6 +6,8 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
+import json
+import time
 from copy import copy
 from typing import Any, NamedTuple
 
@@ -462,6 +464,13 @@ class GPUARModelRunner(OmniGPUModelRunner):
         self._draft_token_req_ids = None
         self.input_batch.prev_sampled_token_ids = None
 
+        profile_metrics: dict[str, float] = {}
+        if hasattr(self.model, "pop_last_profile_metrics"):
+            try:
+                profile_metrics = self.model.pop_last_profile_metrics()
+            except Exception as e:
+                logger.warning(f"Failed to pop profile metrics: {e}")
+
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
@@ -593,6 +602,69 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     logger.error(f"Error in merge multimodal outputs: {e}")
 
         pooler_output: list[dict[str, object]] = []
+        batch_total_scheduled_tokens = int(num_scheduled_tokens_np.sum())
+        embed_multimodal_ms = float(profile_metrics.get("embed_multimodal_ms", 0.0) or 0.0)
+        forward_ms = float(profile_metrics.get("forward_ms", 0.0) or 0.0)
+        for rid in req_ids_output_copy:
+            add_info = self.model_intermediate_buffer.setdefault(rid, {})
+            add_info.setdefault("embed_multimodal_ms_list", []).append(embed_multimodal_ms)
+            add_info.setdefault("forward_ms_list", []).append(forward_ms)
+            add_info.setdefault("encoder_cache_hit_list", []).append(int(add_info.get("encoder_cache_hit", 0) or 0))
+            add_info.setdefault("encoder_cache_miss_list", []).append(int(add_info.get("encoder_cache_miss", 0) or 0))
+            add_info.setdefault("encoder_cache_skipped_list", []).append(int(add_info.get("encoder_cache_skipped", 0) or 0))
+            add_info.setdefault("encoder_not_needed_this_step_list", []).append(
+                int(add_info.get("encoder_not_needed_this_step", 0) or 0)
+            )
+
+        batch_should_log = bool(profile_metrics) and any(
+            not self.model_intermediate_buffer.setdefault(rid, {}).get("stage0_profile_logged")
+            for rid in req_ids_output_copy
+        )
+        if batch_should_log:
+            profile_now = float(time.time())
+            profile_duration_ms = embed_multimodal_ms
+            profile_start = profile_now - profile_duration_ms / 1000.0
+            for rid in req_ids_output_copy:
+                req_state = self.requests.get(rid)
+                idx = req_id_to_index_output_copy[rid]
+                prompt_tokens = len(req_state.prompt_token_ids) if req_state and req_state.prompt_token_ids is not None else 0
+                output_tokens = len(req_state.output_token_ids) if req_state else 0
+                scheduled_tokens = int(num_scheduled_tokens_np[idx])
+                add_info = self.model_intermediate_buffer.setdefault(rid, {})
+                logger.info(
+                    "[Stage0Profile] %s",
+                    json.dumps(
+                        {
+                            "request_id": rid,
+                            "batch_size": len(req_ids_output_copy),
+                            "batch_total_scheduled_tokens": batch_total_scheduled_tokens,
+                            "scheduled_tokens": scheduled_tokens,
+                            "prompt_tokens": prompt_tokens,
+                            "output_tokens": output_tokens,
+                            "embed_multimodal_ms": embed_multimodal_ms,
+                            "forward_ms": forward_ms,
+                            "encoder_cache_hit": int(add_info.get("encoder_cache_hit", 0) or 0),
+                            "encoder_cache_miss": int(add_info.get("encoder_cache_miss", 0) or 0),
+                            "encoder_cache_skipped": int(add_info.get("encoder_cache_skipped", 0) or 0),
+                            "encoder_not_needed_this_step": int(
+                                add_info.get("encoder_not_needed_this_step", 0) or 0
+                            ),
+                            "embed_multimodal_ms_list": list(add_info.get("embed_multimodal_ms_list", [])),
+                            "forward_ms_list": list(add_info.get("forward_ms_list", [])),
+                            "encoder_cache_hit_list": list(add_info.get("encoder_cache_hit_list", [])),
+                            "encoder_cache_miss_list": list(add_info.get("encoder_cache_miss_list", [])),
+                            "encoder_cache_skipped_list": list(add_info.get("encoder_cache_skipped_list", [])),
+                            "encoder_not_needed_this_step_list": list(
+                                add_info.get("encoder_not_needed_this_step_list", [])
+                            ),
+                            "start": profile_start,
+                            "now": profile_now,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                )
+                add_info["stage0_profile_logged"] = True
         for rid in req_ids_output_copy:
             idx = req_id_to_index_output_copy[rid]
             start = int(self.query_start_loc.cpu[idx])
@@ -600,7 +672,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
             end = start + sched
             hidden_slice = hidden_states_cpu[start:end]
             payload: dict[str, object] = {"hidden": hidden_slice}
-            add_info = self.model_intermediate_buffer.get(rid, {})
+            add_info = self.model_intermediate_buffer.setdefault(rid, {})
             if mm_cpu:
                 mm_payload: dict[str, object] = {}
                 for k, v in mm_cpu.items():

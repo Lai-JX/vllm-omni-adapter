@@ -1,4 +1,4 @@
-"""Batch sweep with in-process AsyncOmni requests."""
+"""Batch sweep with in-process AsyncOmni requests using tokenized Alpamayo inputs."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import os
 import re
 import sys
 import time
-import uuid
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
@@ -18,21 +17,36 @@ from typing import Any
 import numpy as np
 import torch
 import yaml
+from omegaconf import OmegaConf
+from transformers import AutoConfig
 from vllm import SamplingParams
 
 OMNI = Path(__file__).resolve().parents[1]
-for p in [str(OMNI), str(OMNI.parent / "alpamayo1.5" / "src"), str(OMNI.parent / "verl-liming" / "my_example" / "alpamayo" / "src")]:
+VERL_ROOT = OMNI.parent / "verl"
+MY_EXAMPLE2_ROOT = VERL_ROOT / "my_example2"
+
+for p in [
+    str(OMNI),
+    str(OMNI.parent / "alpamayo1.5" / "src"),
+    str(OMNI.parent / "verl-liming" / "my_example" / "alpamayo" / "src"),
+    str(VERL_ROOT),
+    str(MY_EXAMPLE2_ROOT),
+]:
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from profiler.run_rollout_timing import (  # noqa: E402
-    _build_prompt_messages,
-    _load_clip_data,
-    _load_local_avdi,
-    _to_jsonable,
+from my_example2.src.inputs.alpamayo_batch import (  # noqa: E402
+    build_alpamayo_sample,
+    build_omni_additional_information,
+    build_rollout_preprocess_fn,
+    build_rollout_processor,
+    build_traj_fuser,
+    sample_to_vllm_prompt,
+    validate_local_pai_dir,
 )
+from my_example2.src.models.register_vla_models import register_vla_models  # noqa: E402
+from profiler.run_rollout_timing import _to_jsonable  # noqa: E402
 from profiler.timestamps import render_request_timeline as request_timeline  # noqa: E402
-import tests.diffusion.models.alpamoya.custom_test.offline.common as ct  # noqa: E402
 from vllm_omni.entrypoints.async_omni import AsyncOmni  # noqa: E402
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams  # noqa: E402
 from vllm_omni.model_executor.stage_input_processors.alpamayo1_5 import (  # noqa: E402
@@ -40,11 +54,17 @@ from vllm_omni.model_executor.stage_input_processors.alpamayo1_5 import (  # noq
 )
 
 DEFAULT_MODEL_PATH = "/share/models/Alpamayo-1.5-10B"
+DEFAULT_PAI_LOCAL_DIR = "/share/datasets/Alpamayo_pai_av_big/"
+DEFAULT_TRAIN_FILE = str((MY_EXAMPLE2_ROOT / "datasets" / "train.parquet").resolve())
+
 MODEL = os.environ.get("MODEL_PATH", str(DEFAULT_MODEL_PATH))
+PAI_LOCAL_DIR = os.environ.get("PAI_LOCAL_DIR", DEFAULT_PAI_LOCAL_DIR)
+TRAIN_FILE = os.environ.get("TRAIN_FILE", DEFAULT_TRAIN_FILE)
+PAI_CHUNK_IDS_ENV = os.environ.get("PAI_CHUNK_IDS", "").strip()
 T0_US = int(os.environ.get("T0_US", "5100000"))
-N_UNIQUE = int(os.environ.get("N_UNIQUE", "1"))
-N_TOTAL = int(os.environ.get("N_TOTAL", "1"))
-BS_LIST = [int(v) for v in os.environ.get("BS_LIST", "1").split(",") if v.strip()]
+N_UNIQUE = int(os.environ.get("N_UNIQUE", "64"))
+N_TOTAL = int(os.environ.get("N_TOTAL", "64"))
+BS_LIST = [int(v) for v in os.environ.get("BS_LIST", "8").split(",") if v.strip()]
 MAX_REQ_PER_GROUP = int(os.environ.get("MAX_REQ_PER_GROUP", "24"))
 CHUNK_SAMPLES = int(os.environ.get("CHUNK_SAMPLES", "16"))
 SVC_YAML = OMNI / "profiler" / "alpamayo1_5_gpu0.yaml"
@@ -53,13 +73,16 @@ PROFILE_STAGES_ENV = os.environ.get("PROFILE_STAGES", "0,1").strip()
 GPU_RECOVERY_POLL_S = float(os.environ.get("GPU_RECOVERY_POLL_S", "2.0"))
 GPU_RECOVERY_TIMEOUT_S = float(os.environ.get("GPU_RECOVERY_TIMEOUT_S", "180.0"))
 GPU_RECOVERY_MARGIN_GB = float(os.environ.get("GPU_RECOVERY_MARGIN_GB", "1.0"))
-REQUEST_UID = os.environ.get("REQUEST_UID", uuid.uuid4().hex[:8])
+GENERATE_TRAJ_TOKENS_ENV = os.environ.get("GENERATE_TRAJ_TOKENS", "0").strip()
+SKIP_WARMUP_SAMPLE_ENV = os.environ.get("SKIP_WARMUP_SAMPLE", "0").strip()
 
-LOG_DIR = OMNI / "profiler" / "logs" / str(N_TOTAL) / f"async_omni_inproc_trace-gid{PROFILE_GID_ENV}_{int(time.time())}"
+LOG_DIR = OMNI / "profiler" / "logs" / str(N_TOTAL) / f"async_omni_inproc_tokenized_warmup_trace-gid{PROFILE_GID_ENV}_{int(time.time())}"
 ASYNC_OMNI_LOG_DIR = LOG_DIR / "svc_logs"
 OUT = LOG_DIR / "metrics" / "batch_results.md"
 PROFILE_DIR = LOG_DIR / "torch_traces"
 RUNTIME_SVC_YAML = LOG_DIR / SVC_YAML.name
+TOKENIZED_STAGE0_TRAJ_START_TOKEN_ID = 155681
+TOKENIZED_STAGE0_TRAJ_END_TOKEN_ID = 155683
 
 KV_TIMING_RE = re.compile(
     r"KV transfer timing: req=(?P<req>\S+) "
@@ -68,6 +91,7 @@ KV_TIMING_RE = re.compile(
     r"extract_plus_transfer_ms=(?P<extract_plus_transfer_ms>\d+(?:\.\d+)?)"
 )
 RID_SUFFIX_RE = re.compile(r"(async-inproc-bs\d+-\S+)$")
+WARMUP_REQUEST_ID_MARKER = "-warmup-"
 
 
 def _output_prefix(default_path: Path) -> Path:
@@ -75,7 +99,6 @@ def _output_prefix(default_path: Path) -> Path:
 
 
 def _parse_profile_gid():
-    """Parse PROFILE_GID env into a 0-based group id to profile."""
     if not PROFILE_GID_ENV:
         return None
     gids = set()
@@ -90,7 +113,6 @@ def _parse_profile_gid():
 
 
 def _parse_profile_stages():
-    """Parse PROFILE_STAGES env into stage list."""
     if not PROFILE_STAGES_ENV:
         return None
     stages = []
@@ -102,31 +124,130 @@ def _parse_profile_stages():
     return stages or None
 
 
+def _parse_chunk_ids():
+    if not PAI_CHUNK_IDS_ENV:
+        return None
+    return [chunk_id.strip() for chunk_id in PAI_CHUNK_IDS_ENV.split(",") if chunk_id.strip()]
+
+
+def _parse_bool_flag(raw_value: str, *, name: str, default: bool) -> bool:
+    if not raw_value:
+        return default
+
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Invalid {name} value: {raw_value!r}")
+
+
+def _build_dataset_config() -> Any:
+    return OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "model": {
+                    "path": MODEL,
+                }
+            },
+            "data": {
+                "train_files": TRAIN_FILE,
+                "pai_local_dir": PAI_LOCAL_DIR,
+                "pai_chunk_ids": _parse_chunk_ids(),
+            },
+        }
+    )
+
+
+def _cfg_get(config: Any, key: str, default: Any = None) -> Any:
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        return config.get(key, default)
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        try:
+            return getter(key, default)
+        except TypeError:
+            pass
+    return getattr(config, key, default)
+
+
+def _cfg_select(config: Any, path: str, default: Any = None) -> Any:
+    cur = config
+    for part in path.split("."):
+        cur = _cfg_get(cur, part, None)
+        if cur is None:
+            return default
+    return cur
+
+
+def _build_local_pai_interface(local_dir: str, chunk_ids: Any | None = None) -> Any:
+    from alpamayo_r1.data.pai_utils import PhysicalAIAVDatasetLocalInterface
+
+    return PhysicalAIAVDatasetLocalInterface(local_dir=local_dir, chunk_ids=chunk_ids)
+
+
 def _build_runtime_stage_config(
     source_stage_config_path: Path = SVC_YAML,
     runtime_stage_config_path: Path = RUNTIME_SVC_YAML,
     profile_dir: Path = PROFILE_DIR,
+    apply_tokenized_stage0_overrides: bool = True,
+    enable_prefix_caching: bool = True,
 ) -> Path:
-    """Create a temporary stage config with torch_profiler_dir rewritten."""
     profile_dir = Path(profile_dir)
     profile_dir.mkdir(parents=True, exist_ok=True)
     runtime_stage_config_path.parent.mkdir(parents=True, exist_ok=True)
 
-    config_text = source_stage_config_path.read_text(encoding="utf-8")
-    updated_text, replacements = re.subn(
-        r"^(\s*torch_profiler_dir:\s*).*$",
-        rf"\1{profile_dir}",
-        config_text,
-        flags=re.MULTILINE,
-    )
+    yaml_config = yaml.safe_load(source_stage_config_path.read_text(encoding="utf-8"))
+    stage_args = yaml_config.get("stage_args") or []
+    replacements = 0
+
+    for stage_config in stage_args:
+        if stage_config.get("stage_id") == 0:
+            stage_config.pop("request_postprocess_func", None)
+            stage_config.pop("prompt_rewrite_func", None)
+            engine_args = stage_config.setdefault("engine_args", {})
+            engine_args["enable_prefix_caching"] = enable_prefix_caching
+            if apply_tokenized_stage0_overrides:
+                _apply_tokenized_stage0_overrides(stage_config)
+
+        engine_args = stage_config.get("engine_args") or {}
+        profiler_config = engine_args.get("profiler_config") or {}
+        if "torch_profiler_dir" not in profiler_config:
+            continue
+        profiler_config["torch_profiler_dir"] = str(profile_dir)
+        replacements += 1
+
     if replacements == 0:
-        raise RuntimeError(f"No torch_profiler_dir entries found in {source_stage_config_path}")
-    runtime_stage_config_path.write_text(updated_text, encoding="utf-8")
+        raise RuntimeError(
+            f"No torch_profiler_dir entries found in stage_args engine_args profiler_config of "
+            f"{source_stage_config_path}"
+        )
+
+    runtime_stage_config_path.write_text(
+        yaml.safe_dump(yaml_config, sort_keys=False),
+        encoding="utf-8",
+    )
     print(
         f"  Wrote runtime stage config {runtime_stage_config_path} "
-        f"(torch_profiler_dir -> {profile_dir})"
+        f"(torch_profiler_dir -> {profile_dir}, "
+        f"tokenized_stage0_overrides={'on' if apply_tokenized_stage0_overrides else 'off'})"
     )
     return runtime_stage_config_path
+
+
+def _apply_tokenized_stage0_overrides(stage_config: dict[str, Any]) -> None:
+    engine_args = stage_config.setdefault("engine_args", {})
+    engine_args.pop("logits_processors", None)
+
+    omni_kv_config = engine_args.setdefault("omni_kv_config", {})
+    kv_transfer_criteria = omni_kv_config.setdefault("kv_transfer_criteria", {})
+    kv_transfer_criteria["type"] = "next_step_after_special_token"
+    kv_transfer_criteria["token_id"] = TOKENIZED_STAGE0_TRAJ_START_TOKEN_ID
+
+    default_sampling_params = stage_config.setdefault("default_sampling_params", {})
+    default_sampling_params["stop_token_ids"] = [TOKENIZED_STAGE0_TRAJ_END_TOKEN_ID]
 
 
 @contextmanager
@@ -159,7 +280,6 @@ def _omni_env():
 
 
 def _start_omni(bs_val, log_stat=True) -> AsyncOmni:
-    """Start AsyncOmni in-process for a given batch size."""
     kwargs: dict[str, Any] = {
         "stage_configs_path": str(RUNTIME_SVC_YAML),
     }
@@ -215,13 +335,19 @@ def _clone_value(value: Any) -> Any:
 
 
 def _materialize_prompt(sample):
-    return {
-        "prompt": sample["prompt_text"],
-        "multi_modal_data": {
-            "image": [image.copy() for image in sample["images"]],
-        },
+    prompt: dict[str, Any] = {
+        "prompt_token_ids": list(sample["prompt_token_ids"]),
         "additional_information": _clone_value(sample["additional_information"]),
     }
+    if sample.get("postprocess_prompt_token_ids") is not None:
+        prompt["postprocess_prompt_token_ids"] = list(sample["postprocess_prompt_token_ids"])
+    if sample.get("multi_modal_data") is not None:
+        prompt["multi_modal_data"] = _clone_value(sample["multi_modal_data"])
+    if sample.get("mm_processor_kwargs") is not None:
+        prompt["mm_processor_kwargs"] = _clone_value(sample["mm_processor_kwargs"])
+    if sample.get("hf_processor_mm_kwargs") is not None:
+        prompt["hf_processor_mm_kwargs"] = _clone_value(sample["hf_processor_mm_kwargs"])
+    return prompt
 
 
 def _load_sampling_params_from_yaml(tokenizer) -> tuple[SamplingParams, OmniDiffusionSamplingParams]:
@@ -259,8 +385,20 @@ def _load_sampling_params_from_yaml(tokenizer) -> tuple[SamplingParams, OmniDiff
     return stage0_params, stage1_params
 
 
+async def _run_request(omni, prompt, request_id, sampling_params_list):
+    final_output = None
+    async for out in omni.generate(
+        prompt=prompt,
+        request_id=request_id,
+        sampling_params_list=sampling_params_list,
+    ):
+        final_output = out
+    if final_output is None:
+        raise RuntimeError("no final output")
+    return final_output
+
+
 def _build_result_from_output(output, cid, rid, lat):
-    """Convert in-process output into the same metrics layout as HTTP sweep."""
     m = dict(getattr(output, "metrics", {}) or {})
     co = dict(m.get("custom_output", {}) or {})
     co.update(dict(getattr(output, "custom_output", {}) or {}))
@@ -338,7 +476,6 @@ def _build_result_from_output(output, cid, rid, lat):
 
 
 def _load_kv_metrics_from_log(bs):
-    """Load all stage-0 KV timing metrics for one batch size from service log."""
     log_path = ASYNC_OMNI_LOG_DIR / f"svc_bs{bs}.log"
     if not log_path.exists():
         return {}
@@ -360,7 +497,6 @@ def _load_kv_metrics_from_log(bs):
 
 
 def _build_group_agg(results, wall_ms):
-    """Build aggregate stats for one group from per-request results."""
     ok_results = [r for r in results if r.get("ok")]
     n_ok = len(ok_results)
     agg = {"wall_ms": wall_ms, "ok": n_ok}
@@ -389,23 +525,22 @@ def _build_group_agg(results, wall_ms):
         "api_server_route_total_ms",
     ]
     if n_ok:
-        for k in metric_keys:
-            vals = [r[k] for r in ok_results]
-            agg[f"avg_{k}"] = np.mean(vals)
-            agg[f"min_{k}"] = np.min(vals)
-            agg[f"max_{k}"] = np.max(vals)
+        for key in metric_keys:
+            vals = [r[key] for r in ok_results]
+            agg[f"avg_{key}"] = np.mean(vals)
+            agg[f"min_{key}"] = np.min(vals)
+            agg[f"max_{key}"] = np.max(vals)
         agg["bs_it"] = sum(r["it"] for r in ok_results)
         agg["bs_ot"] = sum(r["ot"] for r in ok_results)
         agg["bs_at"] = agg["bs_it"] + agg["bs_ot"]
     else:
-        for k in metric_keys:
-            agg[f"avg_{k}"] = agg[f"min_{k}"] = agg[f"max_{k}"] = 0.0
+        for key in metric_keys:
+            agg[f"avg_{key}"] = agg[f"min_{key}"] = agg[f"max_{key}"] = 0.0
         agg["bs_it"] = agg["bs_ot"] = agg["bs_at"] = 0
     return agg
 
 
 def _backfill_kv_metrics_from_log(bs, bs_data):
-    """Backfill per-request KV timing metrics by reading the log once."""
     kv_metrics_by_rid = _load_kv_metrics_from_log(bs)
     for grp in bs_data:
         for req in grp.get("reqs", []):
@@ -426,20 +561,26 @@ def _backfill_kv_metrics_from_log(bs, bs_data):
         grp["agg"] = _build_group_agg(grp.get("reqs", []), grp["agg"]["wall_ms"])
 
 
+def _is_warmup_request_id(request_id: str) -> bool:
+    return WARMUP_REQUEST_ID_MARKER in request_id
+
+
 def _render_timeline_html_for_log(log_path: Path, bs: int) -> Path | None:
-    """Render request timeline HTML for one service log."""
     if not log_path.exists():
         print(f"  timeline skip: missing log {log_path}")
         return None
 
     try:
         order, rows, profiles = request_timeline.parse_log(log_path)
+        filtered_order = [req_id for req_id in order if not _is_warmup_request_id(req_id)]
+        filtered_rows = {req_id: rows[req_id] for req_id in filtered_order}
+        filtered_profiles = {req_id: profiles.get(req_id, {}) for req_id in filtered_order}
         batch_size = request_timeline.infer_batch_size(log_path)
         if batch_size is None:
-            batch_size = request_timeline.infer_batch_size_from_requests(order)
+            batch_size = request_timeline.infer_batch_size_from_requests(filtered_order)
         if batch_size is None:
             batch_size = bs
-        payload = request_timeline.build_requests_payload(order, rows, batch_size, profiles)
+        payload = request_timeline.build_requests_payload(filtered_order, filtered_rows, batch_size, filtered_profiles)
         if not payload["requests"]:
             print(f"  timeline skip: no request metrics found in {log_path.name}")
             return None
@@ -453,32 +594,21 @@ def _render_timeline_html_for_log(log_path: Path, bs: int) -> Path | None:
 
 
 async def one_async(omni, sampling_params_list, sample, idx, bs, sem):
-    """Send one request asynchronously via AsyncOmni; return metrics dict."""
-    rid = f"async-inproc-bs{bs}-{REQUEST_UID}-{sample['cid'][:8]}-{idx}"
+    rid = f"async-inproc-bs{bs}-{sample['cid'][:8]}-{idx}"
     st = time.time()
     async with sem:
         try:
-            stage0_params, stage1_params = sampling_params_list
-            final_output = None
-            async for out in omni.generate(
-                prompt=_materialize_prompt(sample),
-                request_id=rid,
-                sampling_params_list=[stage0_params, stage1_params],
-            ):
-                final_output = out
-            if final_output is None:
-                raise RuntimeError("no final output")
+            prompt = _materialize_prompt(sample)
+            final_output = await _run_request(omni, prompt, rid, list(sampling_params_list))
             lat = (time.time() - st) * 1e3
             return _build_result_from_output(final_output, sample["cid"], rid, lat)
         except Exception as e:
             err_str = repr(e)[:200]
             print(f"  ERR rid={rid} {err_str}")
-            return {"ok": False, "c": sample["cid"], "rid": rid,
-                    "lat": (time.time() - st) * 1e3, "err": err_str}
+            return {"ok": False, "c": sample["cid"], "rid": rid, "lat": (time.time() - st) * 1e3, "err": err_str}
 
 
 async def run_group_async(omni, sampling_params_list, grp, gi, bs):
-    """Run one batch group; return (wall_ms, per_req_list, group_agg)."""
     workers = min(len(grp), 8 if bs <= 8 else 4)
     sem = asyncio.Semaphore(workers)
     t0 = time.time()
@@ -491,73 +621,49 @@ async def run_group_async(omni, sampling_params_list, grp, gi, bs):
     return wall_ms, results, _build_group_agg(results, wall_ms)
 
 
+async def run_warmup_once(omni, sampling_params_list, sample, bs):
+    warmup_rid = f"async-inproc-bs{bs}{WARMUP_REQUEST_ID_MARKER}{sample['cid'][:8]}-init"
+    prompt = _materialize_prompt(sample)
+    await _run_request(omni, prompt, warmup_rid, list(sampling_params_list))
+
+
 def gen(all_batches, clip_stats):
-    """3 tables: per-request detail, per-group stats, per-BS throughput."""
-    L = ["# Batch Sweep", "",
-         f"- {time.strftime('%Y-%m-%d %H:%M:%S')} | {N_TOTAL} samples | GPU0",
-         f"- disk_io mean={clip_stats['disk']:.0f}ms | prep mean={clip_stats['prep']:.0f}ms",
-         "",
-         "## 表1: 逐请求详细指标",
-         "",
-         "| bs | gid | rid | lat_ms | net_ms | inf_ms | s0_llm_ms | kv_tran_total | s1_diffusion_ms | kv_s0_extract_plus_transfer_ms | kv_s1_receive_ms | itok | otok |",
-         "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    lines = [
+        "# Batch Sweep",
+        "",
+        f"- {time.strftime('%Y-%m-%d %H:%M:%S')} | {N_TOTAL} samples | GPU0 | tokenized input",
+        f"- build_input mean={clip_stats['build']:.0f}ms",
+        "",
+        "## 表1: 逐请求详细指标",
+        "",
+        "| bs | gid | rid | lat_ms | net_ms | inf_ms | s0_llm_ms | kv_tran_total | s1_diffusion_ms | kv_s0_extract_plus_transfer_ms | kv_s1_receive_ms | itok | otok |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
 
     for bs in BS_LIST:
         for grp in all_batches.get(bs, []):
             for req in grp.get("reqs", []):
                 if not req.get("ok"):
                     continue
-                L.append(f"| {bs} | {grp['gid']} | {req['rid']} | {req['lat']:.0f} | {req['net']:.0f}"
-                         f" | {req['inf']:.0f} | {req['s0_llm_ms']:.0f} | {req['kv_tran_total']:.0f}"
-                         f" | {req['s1_diffusion_ms']:.0f} | {req['kv_s0_extract_plus_transfer_ms']:.0f}"
-                         f" | {req['kv_s1_receive_ms']:.0f} | {req['it']} | {req['ot']} |")
+                lines.append(
+                    f"| {bs} | {grp['gid']} | {req['rid']} | {req['lat']:.0f} | {req['net']:.0f}"
+                    f" | {req['inf']:.0f} | {req['s0_llm_ms']:.0f} | {req['kv_tran_total']:.0f}"
+                    f" | {req['s1_diffusion_ms']:.0f} | {req['kv_s0_extract_plus_transfer_ms']:.0f}"
+                    f" | {req['kv_s1_receive_ms']:.0f} | {req['it']} | {req['ot']} |"
+                )
 
-    L += ["",
-          "## 表2: 逐 BS 请求级指标统计",
-          "",
-          "说明：",
-          "- metric: 指标名称。",
-          "- min: 该 bs 下所有请求该指标最小值。",
-          "- max: 该 bs 下所有请求该指标最大值。",
-          "- mean: 该 bs 下所有请求该指标平均值。",
-          "",
-          "| bs | metric | min | max | mean |",
-          "|---:|---:|---:|---:|---:|"]
+    lines += [
+        "",
+        "## 表2: 逐 BS 请求级指标统计",
+        "",
+        "| bs | metric | min | max | mean |",
+        "|---:|---:|---:|---:|---:|",
+    ]
 
     metric_names = [
-        ("lat_ms", "lat"), ("net_ms", "net"), ("inf_ms", "inf"),
-        ("client_encode_ms", "client_encode_ms"), ("client_http_ms", "client_http_ms"),
-        ("client_decode_ms", "client_decode_ms"), ("client_codec_ms", "client_codec_ms"),
-        ("openai_handler_total_ms", "openai_handler_total_ms"),
-        ("openai_pre_full_generator_ms", "openai_pre_full_generator_ms"),
-        ("openai_check_model_ms", "openai_check_model_ms"),
-        ("openai_prepare_runtime_ms", "openai_prepare_runtime_ms"),
-        ("openai_preprocess_chat_ms", "openai_preprocess_chat_ms"),
-        ("openai_preprocess_merge_kwargs_ms", "openai_preprocess_merge_kwargs_ms"),
-        ("openai_preprocess_build_params_ms", "openai_preprocess_build_params_ms"),
-        ("openai_preprocess_audio_injection_ms", "openai_preprocess_audio_injection_ms"),
-        ("openai_preprocess_render_chat_ms", "openai_preprocess_render_chat_ms"),
-        ("openai_preprocess_get_tokenizer_ms", "openai_preprocess_get_tokenizer_ms"),
-        ("openai_preprocess_tool_adjust_ms", "openai_preprocess_tool_adjust_ms"),
-        ("openai_preprocess_image_cleanup_ms", "openai_preprocess_image_cleanup_ms"),
-        ("openai_preprocess_finalize_prompt_ms", "openai_preprocess_finalize_prompt_ms"),
-        ("api_server_pre_route_ms", "api_server_pre_route_ms"),
-        ("api_server_request_body_ms", "api_server_request_body_ms"),
-        ("api_server_request_json_ms", "api_server_request_json_ms"),
-        ("api_server_pre_route_other_ms", "api_server_pre_route_other_ms"),
-        ("api_server_request_body_bytes", "api_server_request_body_bytes"),
-        ("api_server_endpoint_setup_ms", "api_server_endpoint_setup_ms"),
-        ("api_server_handler_call_ms", "api_server_handler_call_ms"),
-        ("api_server_post_handler_ms", "api_server_post_handler_ms"),
-        ("api_server_response_dump_ms", "api_server_response_dump_ms"),
-        ("api_server_response_render_ms", "api_server_response_render_ms"),
-        ("api_server_route_total_ms", "api_server_route_total_ms"),
-        ("openai_image_prompt_rewrite_ms", "openai_image_prompt_rewrite_ms"),
-        ("openai_schedule_generator_ms", "openai_schedule_generator_ms"),
-        ("openai_result_wait_ms", "openai_result_wait_ms"),
-        ("openai_postprocess_ms", "openai_postprocess_ms"),
-        ("openai_response_build_ms", "openai_response_build_ms"),
-        ("openai_response_logging_ms", "openai_response_logging_ms"),
+        ("lat_ms", "lat"),
+        ("net_ms", "net"),
+        ("inf_ms", "inf"),
         ("s0_llm_ms", "s0_llm_ms"),
         ("kv_tran_total_ms", "kv_tran_total"),
         ("kv_s0_extract_ms", "kv_s0_extract_ms"),
@@ -567,41 +673,31 @@ def gen(all_batches, clip_stats):
         ("kv_s1_tran_ms", "kv_s1_tran_ms"),
         ("kv_s1_prep_ms", "kv_s1_prep_ms"),
         ("s1_diffusion_ms", "s1_diffusion_ms"),
-        ("itok", "it"), ("otok", "ot"),
+        ("itok", "it"),
+        ("otok", "ot"),
     ]
+
     for bs in BS_LIST:
         all_vals = {key: [] for _, key in metric_names}
         for grp in all_batches.get(bs, []):
             for req in grp.get("reqs", []):
                 if not req.get("ok"):
                     continue
-                for label, key in metric_names:
+                for _, key in metric_names:
                     all_vals[key].append(req.get(key, 0))
         for label, key in metric_names:
             vals = all_vals[key]
             if not vals:
                 continue
-            L.append(f"| {bs} | {label} | {np.min(vals):.0f} | {np.max(vals):.0f} | {np.mean(vals):.0f} |")
+            lines.append(f"| {bs} | {label} | {np.min(vals):.0f} | {np.max(vals):.0f} | {np.mean(vals):.0f} |")
 
-    L += ["",
-          "## 表3: 每 BS 吞吐量",
-          "",
-          "说明：",
-          "- bs: 批大小。",
-          "- n_grp: 该 bs 下分组数。",
-          "- ok: 成功请求总数。",
-          "- E2E_s: 全部分组累计端到端耗时（秒）。",
-          "- batch_it/s: 输入 token 吞吐（tokens/s）。",
-          "- batch_ot/s: 输出 token 吞吐（tokens/s）。",
-          "- batch_at/s: 总 token 吞吐（输入+输出，tokens/s）。",
-          "- avg_sample_ms: 平均每样本耗时（毫秒）。",
-          "- samples/s: 样本吞吐（samples/s）。",
-          "- 相比BS=1: 相对 bs=1 的吞吐加速比。",
-          "",
-          "| bs | n_grp | ok | E2E_s"
-          " | batch_it/s | batch_ot/s | batch_at/s"
-          " | avg_sample_ms | samples/s | 相比BS=1 |",
-          "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    lines += [
+        "",
+        "## 表3: 每 BS 吞吐量",
+        "",
+        "| bs | n_grp | ok | E2E_s | batch_it/s | batch_ot/s | batch_at/s | avg_sample_ms | samples/s | 相比BS=1 |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
 
     base_ss = None
     for bs in BS_LIST:
@@ -619,11 +715,13 @@ def gen(all_batches, clip_stats):
         if base_ss is None:
             base_ss = samples_per_s
         speedup = samples_per_s / base_ss if base_ss > 0 else 0
-        L.append(f"| {bs} | {len(grps)} | {ok_total} | {e2e:.1f}"
-                 f" | {total_it / e2e:.0f} | {total_ot / e2e:.0f} | {total_at / e2e:.0f}"
-                 f" | {avg_sample_ms:.0f} | {samples_per_s:.3f} | {speedup:.2f}x |")
+        lines.append(
+            f"| {bs} | {len(grps)} | {ok_total} | {e2e:.1f}"
+            f" | {total_it / e2e:.0f} | {total_ot / e2e:.0f} | {total_at / e2e:.0f}"
+            f" | {avg_sample_ms:.0f} | {samples_per_s:.3f} | {speedup:.2f}x |"
+        )
 
-    OUT.write_text("\n".join(L))
+    OUT.write_text("\n".join(lines), encoding="utf-8")
     print(f"  -> {OUT}")
 
 
@@ -688,49 +786,135 @@ async def _wait_for_gpu_recovery(*, expected_free_bytes, bs):
         await asyncio.sleep(GPU_RECOVERY_POLL_S)
 
 
+def _build_model_input_components() -> dict[str, Any]:
+    register_vla_models()
+    # Importing the original Alpamayo model module registers
+    # model_type="alpamayo1_5" with Hugging Face AutoConfig.
+    import alpamayo1_5.models.alpamayo1_5  # noqa: F401
+
+    config = _build_dataset_config()
+    model_path = (
+        _cfg_select(config, "actor_rollout_ref.model.path")
+        or _cfg_select(config, "model.path")
+        or _cfg_get(config, "model_path")
+        or _cfg_get(config, "path")
+    )
+    if model_path is None:
+        raise ValueError("model path is required to build tokenized Alpamayo inputs.")
+
+    validate_local_pai_dir(PAI_LOCAL_DIR)
+    model_config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    processor = build_rollout_processor(model_config)
+    preprocess_fn = build_rollout_preprocess_fn(model_config)
+    traj_fuser = build_traj_fuser(model_config)
+    avdi = _build_local_pai_interface(PAI_LOCAL_DIR, _parse_chunk_ids())
+    return {
+        "config": config,
+        "model_config": model_config,
+        "processor": processor,
+        "preprocess_fn": preprocess_fn,
+        "traj_fuser": traj_fuser,
+        "avdi": avdi,
+    }
+
+
+def _build_model_input(
+    *,
+    clip_id: str,
+    t0_us: int,
+    preprocess_fn: Any,
+    processor: Any,
+    model_config: Any,
+    traj_fuser: Any,
+    avdi: Any,
+) -> dict[str, Any]:
+    sample = build_alpamayo_sample(clip_id, t0_us, preprocess_fn, avdi)
+    prompt = sample_to_vllm_prompt(sample, processor.tokenizer, model_config, traj_fuser)
+    if "additional_information" not in prompt:
+        sample_with_cfg = dict(sample)
+        sample_with_cfg["model_config"] = model_config
+        postprocess_prompt_ids = list(prompt.get("postprocess_prompt_token_ids") or prompt.get("prompt_token_ids") or [])
+        prompt["additional_information"] = build_omni_additional_information(
+            sample_with_cfg,
+            postprocess_prompt_ids=postprocess_prompt_ids,
+        )
+    return prompt
+
+
 async def main_async():
     print(f"Batch sweep: {N_TOTAL} samples ({N_UNIQUE} unique clips cycled), BS={BS_LIST}")
-    _build_runtime_stage_config()
+    skip_warmup_sample = _parse_bool_flag(
+        SKIP_WARMUP_SAMPLE_ENV,
+        name="SKIP_WARMUP_SAMPLE",
+        default=False,
+    )
+    print(
+        "Warmup once after engine start: "
+        f"sampling_params=formal_request_params, "
+        f"skip_warmup_sample={skip_warmup_sample}"
+    )
+    apply_tokenized_stage0_overrides = _parse_bool_flag(
+        GENERATE_TRAJ_TOKENS_ENV,
+        name="GENERATE_TRAJ_TOKENS",
+        default=True,
+    )
+    _build_runtime_stage_config(
+        apply_tokenized_stage0_overrides=apply_tokenized_stage0_overrides,
+    )
     tokenizer = build_alpamayo_stage0_tokenizer(MODEL)
     sampling_params_list = _load_sampling_params_from_yaml(tokenizer)
 
-    print("Loading dataset + preparing clips...")
-    avdi = _load_local_avdi()
+    print("Loading dataset + preparing tokenized inputs...")
+    components = _build_model_input_components()
+    avdi = components["avdi"]
     ci = avdi.clip_index
     print(len(list(ci[ci.chunk == 3116].index)))
     unique_cids = list(ci[ci.chunk == 3116].index)[:N_UNIQUE]
 
-    clips_unique, disk_ms_list, prep_ms_list = [], [], []
+    samples_unique = []
+    build_ms_list = []
     for i, cid in enumerate(unique_cids):
-        td = time.time()
-        data = _load_clip_data(cid, T0_US, avdi)
-        dms = (time.time() - td) * 1e3
-        tp = time.time()
-        fr = data["image_frames"].flatten(0, 1)
-        pm = _build_prompt_messages(
-            camera_indices=data["camera_indices"],
-            num_frames_per_camera=int(data["image_frames"].shape[1]))
-        prompt, prompt_text = ct.build_prompt_from_messages(
-            pm,
-            data=data,
-            frames=fr,
-            tokenizer=tokenizer,
+        t_build = time.perf_counter()
+        model_input = _build_model_input(
+            clip_id=str(cid),
+            t0_us=T0_US,
+            preprocess_fn=components["preprocess_fn"],
+            processor=components["processor"],
+            model_config=components["model_config"],
+            traj_fuser=components["traj_fuser"],
+            avdi=components["avdi"],
         )
-        pms = (time.time() - tp) * 1e3
-        clips_unique.append({
-            "cid": cid,
-            "prompt_text": prompt_text,
-            "images": list(prompt["multi_modal_data"]["image"]),
-            "additional_information": dict(prompt["additional_information"]),
-        })
-        disk_ms_list.append(dms)
-        prep_ms_list.append(pms)
-        print(f"  {i + 1}/{N_UNIQUE} clip={cid[:8]} disk={dms:.0f}ms prep={pms:.0f}ms")
+        build_ms = (time.perf_counter() - t_build) * 1000.0
+        samples_unique.append(
+            {
+                "cid": str(cid),
+                "prompt_token_ids": list(model_input.get("prompt_token_ids") or []),
+                "postprocess_prompt_token_ids": list(
+                    model_input.get("postprocess_prompt_token_ids") or model_input.get("prompt_token_ids") or []
+                ),
+                "multi_modal_data": _clone_value(model_input.get("multi_modal_data") or {}),
+                "mm_processor_kwargs": _clone_value(model_input.get("mm_processor_kwargs")),
+                "hf_processor_mm_kwargs": _clone_value(model_input.get("hf_processor_mm_kwargs")),
+                "additional_information": _clone_value(model_input.get("additional_information") or {}),
+            }
+        )
+        build_ms_list.append(build_ms)
+        print(
+            f"  {i + 1}/{N_UNIQUE} clip={str(cid)[:8]} "
+            f"build={build_ms:.0f}ms prompt_tokens={len(samples_unique[-1]['prompt_token_ids'])}"
+        )
 
-    cs = {"disk": np.mean(disk_ms_list), "prep": np.mean(prep_ms_list)}
-    print(f"Preload done. disk_mean={cs['disk']:.0f}ms prep_mean={cs['prep']:.0f}ms\n")
+    cs = {"build": float(np.mean(build_ms_list)) if build_ms_list else 0.0}
+    print(f"Preload done. build_mean={cs['build']:.0f}ms\n")
 
-    samples = (clips_unique * ((N_TOTAL // N_UNIQUE) + 1))[:N_TOTAL]
+    warmup_sample = samples_unique[0] if samples_unique else None
+    samples = (samples_unique * ((N_TOTAL // max(1, N_UNIQUE)) + 1))[:N_TOTAL]
+    if skip_warmup_sample and warmup_sample is not None and samples:
+        samples = samples[1:]
+        print(
+            f"Skipping warmup sample from formal requests: clip={warmup_sample['cid'][:8]}, "
+            f"remaining_samples={len(samples)}"
+        )
 
     all_batches = {}
     profile_gids = _parse_profile_gid()
@@ -750,11 +934,16 @@ async def main_async():
             with _redirect_process_output(log_path):
                 omni = _start_omni(bs)
         try:
-            n_groups = (N_TOTAL + bs - 1) // bs
+            n_groups = (len(samples) + bs - 1) // bs if samples else 0
             grp_per_chunk = max(1, CHUNK_SAMPLES // bs)
             print(f"BATCH={bs}  ({n_groups} groups x {bs}, chunk={grp_per_chunk} groups)")
             bs_data = []
             done_reqs = 0
+
+            if warmup_sample is not None:
+                print(f"BATCH={bs} warmup once with clip={warmup_sample['cid'][:8]}")
+                with _redirect_process_output(log_path):
+                    await run_warmup_once(omni, sampling_params_list, warmup_sample, bs)
 
             for chunk_start in range(0, n_groups, grp_per_chunk):
                 chunk_end = min(chunk_start + grp_per_chunk, n_groups)
@@ -780,8 +969,10 @@ async def main_async():
                     bs_data.append({"gid": gi, "reqs": results, "agg": agg})
                     total_ok = sum(d["agg"]["ok"] for d in bs_data)
                     done_reqs += len(grp)
-                    print(f"  g{gi+1:4d}/{n_groups} ok={agg['ok']}/{len(grp)} "
-                          f"wall={wm:.0f}ms [cum ok={total_ok}/{done_reqs}]")
+                    print(
+                        f"  g{gi+1:4d}/{n_groups} ok={agg['ok']}/{len(grp)} "
+                        f"wall={wm:.0f}ms [cum ok={total_ok}/{done_reqs}]"
+                    )
                 if chunk_end < n_groups:
                     print("  chunk done, sleep 8s...")
                     await asyncio.sleep(8)
@@ -791,6 +982,7 @@ async def main_async():
             total_ok = sum(d["agg"]["ok"] for d in bs_data)
             total_wall = sum(d["agg"]["wall_ms"] for d in bs_data)
             print(f"  DONE ok={total_ok}/{N_TOTAL} E2E={total_wall/1e3:.1f}s")
+
             output_prefix = _output_prefix(OUT)
             bs_output_path = output_prefix.with_name(f"{output_prefix.name}_bs_{bs}.json")
             bs_output_payload = _to_jsonable({"all_batches": all_batches, "cs": cs})

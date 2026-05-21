@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import time
 from functools import lru_cache
 from pathlib import Path
 
+import torch
 from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from transformers import AutoConfig
@@ -119,3 +121,49 @@ class Alpamayo1_5Qwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration
     def load_weights(self, weights):
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+    def embed_multimodal(self, **kwargs: object):
+        should_sync = torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing()
+        if should_sync:
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+        try:
+            return super().embed_multimodal(**kwargs)
+        finally:
+            if should_sync:
+                torch.cuda.synchronize()
+            self._last_embed_multimodal_ms = (time.perf_counter() - start) * 1000.0
+
+    def forward(
+        self,
+        input_ids,
+        positions,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        **kwargs: object,
+    ):
+        should_sync = torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing()
+        if should_sync:
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+        try:
+            return super().forward(
+                input_ids,
+                positions,
+                intermediate_tensors=intermediate_tensors,
+                inputs_embeds=inputs_embeds,
+                **kwargs,
+            )
+        finally:
+            if should_sync:
+                torch.cuda.synchronize()
+            self._last_forward_ms = (time.perf_counter() - start) * 1000.0
+
+    def pop_last_profile_metrics(self) -> dict[str, float]:
+        metrics = {
+            "embed_multimodal_ms": float(getattr(self, "_last_embed_multimodal_ms", 0.0) or 0.0),
+            "forward_ms": float(getattr(self, "_last_forward_ms", 0.0) or 0.0),
+        }
+        self._last_embed_multimodal_ms = 0.0
+        self._last_forward_ms = 0.0
+        return metrics

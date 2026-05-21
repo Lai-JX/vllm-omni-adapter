@@ -968,11 +968,19 @@ HTML_TEMPLATE = """<!doctype html>
     function showTooltip(event, req, phase) {
       const startOffset = phase.start - globalStart;
       const endOffset = phase.end - globalStart;
+      const profile = req.profile || {};
+      const profileLines = [];
+      if (profile.prompt_tokens) profileLines.push(`prompt_tokens=${profile.prompt_tokens}`);
+      if (profile.output_tokens) profileLines.push(`output_tokens=${profile.output_tokens}`);
+      if (profile.scheduled_tokens) profileLines.push(`scheduled_tokens=${profile.scheduled_tokens}`);
+      if (profile.embed_multimodal_ms) profileLines.push(`embed_multimodal_ms=${Number(profile.embed_multimodal_ms).toFixed(2)}`);
+      if (profile.forward_ms) profileLines.push(`forward_ms=${Number(profile.forward_ms).toFixed(2)}`);
       tooltip.innerHTML = `
         <div class="tooltip-title">${req.request_id} · ${phase.label}</div>
         <div class="tooltip-line">group=${req.group_id ?? '-'} pos=${req.group_pos ?? '-'} duration=${phase.duration_ms.toFixed(2)} ms</div>
         <div class="tooltip-line">start=${formatAbs(phase.start)} (${formatSec(startOffset)})</div>
         <div class="tooltip-line">end=${formatAbs(phase.end)} (${formatSec(endOffset)})</div>
+        ${profileLines.map(line => `<div class="tooltip-line">${line}</div>`).join('')}
       `;
       tooltip.classList.add('visible');
       moveTooltip(event);
@@ -1087,16 +1095,26 @@ HTML_TEMPLATE = """<!doctype html>
         tickIndex += 1;
       }
 
-      const labelHtml = visibleRequests.map(req => `
+      const labelHtml = visibleRequests.map(req => {
+        const profile = req.profile || {};
+        const profileBits = [
+          profile.prompt_tokens ? `prompt=${profile.prompt_tokens}` : '',
+          profile.output_tokens ? `output=${profile.output_tokens}` : '',
+          profile.scheduled_tokens ? `sched=${profile.scheduled_tokens}` : '',
+          profile.embed_multimodal_ms ? `embed=${Number(profile.embed_multimodal_ms).toFixed(1)}ms` : '',
+          profile.forward_ms ? `fwd=${Number(profile.forward_ms).toFixed(1)}ms` : '',
+        ].filter(Boolean).join(' · ');
+        return `
         <div class="request-label" style="height:${rowHeight}px">
           <div class="request-title">${req.request_id}</div>
           <div class="request-meta">
             index=${req.index}
             ${req.group_id ? `<br>group=${req.group_id} pos=${req.group_pos}` : ''}
             <br>window=${formatSec(req.request_start - globalStart)} -> ${formatSec(req.request_end - globalStart)}
+            ${profileBits ? `<br>${profileBits}` : ''}
           </div>
         </div>
-      `).join('');
+      `}).join('');
 
       let tracksHtml = '';
       let currentGroup = null;
@@ -1225,6 +1243,7 @@ def build_requests_payload(
     order: list[str],
     rows: dict[str, dict[str, dict[str, str]]],
     batch_size: int | None,
+    profiles: dict[str, dict[str, str]],
 ) -> dict:
     requests = []
     global_start = None
@@ -1271,6 +1290,7 @@ def build_requests_payload(
                 "request_start": req_start,
                 "request_end": req_end,
                 "phases": phase_items,
+                "profile": profiles.get(req_id, {}),
             }
         )
 
@@ -1321,7 +1341,7 @@ def main() -> int:
     if not args.logfile.exists():
         parser.error(f"log file does not exist: {args.logfile}")
 
-    order, rows = parse_log(args.logfile)
+    order, rows, profiles = parse_log(args.logfile)
     batch_size = args.bs
     if batch_size is None:
         batch_size = infer_batch_size(args.logfile)
@@ -1330,7 +1350,7 @@ def main() -> int:
     if batch_size is not None and batch_size <= 0:
         parser.error(f"batch size must be positive, got: {batch_size}")
 
-    payload = build_requests_payload(order, rows, batch_size)
+    payload = build_requests_payload(order, rows, batch_size, profiles)
     if not payload["requests"]:
         parser.error("no matching request metrics found in the log")
 

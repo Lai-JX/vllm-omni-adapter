@@ -1142,6 +1142,36 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         return req_infos
 
+    def _record_encoder_cache_stats(self, scheduler_output: "SchedulerOutput") -> None:
+        scheduled_encoder_inputs = scheduler_output.scheduled_encoder_inputs
+        for req_id, req_state in self.requests.items():
+            mm_features = getattr(req_state, "mm_features", None)
+            if not mm_features:
+                continue
+
+            scheduled_ids = set(scheduled_encoder_inputs.get(req_id, []))
+            encoder_cache_hit = 0
+            encoder_cache_miss = 0
+            encoder_cache_skipped = 0
+            encoder_not_needed_this_step = 0
+
+            for mm_input_id, mm_feature in enumerate(mm_features):
+                if mm_feature.data is None:
+                    encoder_cache_skipped += 1
+                    continue
+                if mm_feature.identifier in self.encoder_cache:
+                    encoder_cache_hit += 1
+                elif mm_input_id in scheduled_ids:
+                    encoder_cache_miss += 1
+                else:
+                    encoder_not_needed_this_step += 1
+
+            add_info = self.model_intermediate_buffer.setdefault(req_id, {})
+            add_info["encoder_cache_hit"] = encoder_cache_hit
+            add_info["encoder_cache_miss"] = encoder_cache_miss
+            add_info["encoder_cache_skipped"] = encoder_cache_skipped
+            add_info["encoder_not_needed_this_step"] = encoder_not_needed_this_step
+
     def _preprocess(
         self,
         scheduler_output: "SchedulerOutput",
@@ -1159,6 +1189,7 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         if self.supports_mm_inputs and is_first_rank and not is_encoder_decoder:
             # Run the multimodal encoder if any.
+            self._record_encoder_cache_stats(scheduler_output)
             with self.maybe_get_ec_connector_output(
                 scheduler_output,
                 encoder_cache=self.encoder_cache,

@@ -62,7 +62,7 @@ PAI_LOCAL_DIR = os.environ.get("PAI_LOCAL_DIR", DEFAULT_PAI_LOCAL_DIR)
 TRAIN_FILE = os.environ.get("TRAIN_FILE", DEFAULT_TRAIN_FILE)
 PAI_CHUNK_IDS_ENV = os.environ.get("PAI_CHUNK_IDS", "").strip()
 T0_US = int(os.environ.get("T0_US", "5100000"))
-N_UNIQUE = int(os.environ.get("N_UNIQUE", "1"))
+N_UNIQUE = int(os.environ.get("N_UNIQUE", "64"))
 N_TOTAL = int(os.environ.get("N_TOTAL", "64"))
 BS_LIST = [int(v) for v in os.environ.get("BS_LIST", "8").split(",") if v.strip()]
 MAX_REQ_PER_GROUP = int(os.environ.get("MAX_REQ_PER_GROUP", "24"))
@@ -202,7 +202,7 @@ def _build_runtime_stage_config(
 
     for stage_config in stage_args:
         if stage_config.get("stage_id") == 0:
-            stage_config.pop("renderer_rewrite_func", None)
+            stage_config.pop("request_postprocess_func", None)
             stage_config.pop("prompt_rewrite_func", None)
             if apply_tokenized_stage0_overrides:
                 _apply_tokenized_stage0_overrides(stage_config)
@@ -549,13 +549,13 @@ def _render_timeline_html_for_log(log_path: Path, bs: int) -> Path | None:
         return None
 
     try:
-        order, rows = request_timeline.parse_log(log_path)
+        order, rows, profiles = request_timeline.parse_log(log_path)
         batch_size = request_timeline.infer_batch_size(log_path)
         if batch_size is None:
             batch_size = request_timeline.infer_batch_size_from_requests(order)
         if batch_size is None:
             batch_size = bs
-        payload = request_timeline.build_requests_payload(order, rows, batch_size)
+        payload = request_timeline.build_requests_payload(order, rows, batch_size, profiles)
         if not payload["requests"]:
             print(f"  timeline skip: no request metrics found in {log_path.name}")
             return None
