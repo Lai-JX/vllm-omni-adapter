@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +11,7 @@ import torch
 from transformers import AutoProcessor
 from vllm.inputs import TextPrompt
 
+from vllm_omni.debug.structured_dump import DumpIdentity
 from vllm_omni.inputs.data import OmniTextPrompt, OmniTokensPrompt
 from vllm_omni.model_executor.models.alpamayo1_5.runtime import (
     SPECIAL_TOKENS,
@@ -24,6 +24,47 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_ALPAMAYO_MODEL_PATH = "/share/models/Alpamayo-1.5-10B"
 _FUSION_ASSETS: dict[str, dict[str, Any]] = {}
+
+
+def _dump_actual_stage1_transition(
+    req_id: str,
+    transformed_info: dict[str, Any],
+    *,
+    stage0_request_outputs_len: int,
+    stage0_completion_counts: list[int],
+    trajectory_inputs_len: int,
+    trajectory_input_sample_indices: list[int | None],
+) -> None:
+    from vllm_omni.debug.alpamayo_stage1_rollout_dump import maybe_dump_alpamayo_stage1_rollout
+
+    sample_index = int(transformed_info.get("stage1_rollout_sample_index", 0) or 0)
+    call_index = int(transformed_info.get("stage1_rollout_call_index", 0) or 0)
+    maybe_dump_alpamayo_stage1_rollout(
+        req_id=req_id,
+        phase="stage1_transition",
+        call_index=call_index,
+        sample_index=sample_index,
+        payload={
+            "stage0_prompt_token_ids": _to_cpu_tensor(transformed_info.get("stage0_prompt_token_ids"), dtype=torch.long),
+            "stage0_output_token_ids": _detach_payload(transformed_info.get("stage0_output_token_ids")),
+            "stage0_sequences": _detach_payload(transformed_info.get("stage0_sequences")),
+            "stage0_rope_deltas": _to_cpu_tensor(transformed_info.get("stage0_rope_deltas"), dtype=torch.long),
+            "stage0_prefill_seq_len": transformed_info.get("stage0_prefill_seq_len"),
+            "initial_noise_x0": _detach_payload(transformed_info.get("initial_noise_x0")),
+            "stage0_prompt_length": transformed_info.get("stage0_prompt_length"),
+            "stage0_output_length": transformed_info.get("stage0_output_length"),
+            "stage0_output_lengths": _detach_payload(transformed_info.get("stage0_output_lengths")),
+            "stage0_num_return_sequences": transformed_info.get("stage0_num_return_sequences"),
+            "stage0_attention_mask": _detach_payload(transformed_info.get("stage0_attention_mask")),
+            "stage0_request_outputs_len": stage0_request_outputs_len,
+            "stage0_completion_counts": stage0_completion_counts,
+            "trajectory_inputs_len": trajectory_inputs_len,
+            "trajectory_input_sample_indices": trajectory_input_sample_indices,
+        },
+        metadata={
+            "transition_dump": True,
+        },
+    )
 
 
 def _validate_stage_inputs(stage_list: list[Any], engine_input_source: list[int]) -> list[Any]:
@@ -563,6 +604,8 @@ def vlm2trajectory(
         outputs = list(stage_output.outputs or [])      # CompletionOutput
         if not outputs:
             raise RuntimeError("Stage 0 produced no completion outputs for Alpamayo trajectory rollout")
+        stage0_request_outputs_len = len(stage_outputs)
+        stage0_completion_counts = [len(list(getattr(item, "outputs", []) or [])) for item in stage_outputs]
         original_prompt = _normalize_prompt(prompts[i] if i < len(prompts) else None)
         original_additional_information = _detach_payload(
             original_prompt.get("additional_information") or {}
@@ -586,6 +629,8 @@ def vlm2trajectory(
             transformed_info["stage0_output_length"] = len(output_token_ids)
             transformed_info["stage0_num_return_sequences"] = total_stage0_samples
             transformed_info["stage0_sample_index"] = sample_idx
+            transformed_info["stage1_rollout_call_index"] = 0
+            transformed_info["stage1_rollout_sample_index"] = sample_idx
             transformed_info.setdefault(
                 "num_return_sequences",
                 int(original_additional_information.get("num_return_sequences", 1) or 1),
@@ -617,6 +662,14 @@ def vlm2trajectory(
                     prompt="",
                     additional_information=transformed_info,
                 )
+            )
+            _dump_actual_stage1_transition(
+                req_id=str(getattr(stage_output, "request_id", "unknown")),
+                transformed_info=transformed_info,
+                stage0_request_outputs_len=stage0_request_outputs_len,
+                stage0_completion_counts=stage0_completion_counts,
+                trajectory_inputs_len=total_stage0_samples,
+                trajectory_input_sample_indices=list(range(total_stage0_samples)),
             )
 
     return trajectory_inputs

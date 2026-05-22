@@ -1,19 +1,18 @@
 import asyncio
 import gc
-from pathlib import Path
 
 import numpy as np
 import torch
 
 from alpamoya_compare_original import (
-    REQUEST_ID,
     actual_action_in_proj_internal_dump_path,
     actual_expert_internal_dump_path,
-    actual_stage1_rollout_step_dump_path,
     actual_stage1_rollout_context_dump_path,
+    actual_stage1_rollout_step_dump_path,
     actual_stage1_transition_dump_path,
     build_fixed_initial_noise_x0,
     compare_tensors,
+    dumped_reference_kv_cache_path,
     load_shared_data,
     make_compare_run_dir,
     print_dump_compare_report,
@@ -70,6 +69,7 @@ async def main() -> None:
     dump_dir = make_compare_run_dir()
     initial_noise_x0 = build_fixed_initial_noise_x0()
     shared_data, _, _ = load_shared_data()
+
     _print_section("fixed_x0 setup")
     print(
         "initial_noise_x0 "
@@ -90,31 +90,41 @@ async def main() -> None:
         torch.cuda.ipc_collect()
     await asyncio.sleep(2)
 
-    omni = await run_omni(dump_dir=dump_dir, initial_noise_x0=initial_noise_x0)
+    omni_with_reference_kv = await run_omni(
+        dump_dir=dump_dir,
+        initial_noise_x0=initial_noise_x0,
+        override_kv_path=dumped_reference_kv_cache_path(dump_dir),
+    )
 
     original_ade = compute_min_ade(original["pred_xyz"], shared_data["ego_future_xyz"])
-    omni_ade = compute_min_ade(omni["pred_xyz"], shared_data["ego_future_xyz"])
+    omni_with_reference_kv_ade = compute_min_ade(
+        omni_with_reference_kv["pred_xyz"],
+        shared_data["ego_future_xyz"],
+    )
 
     original["cot_equal_ref"] = True
-    omni["cot_equal_ref"] = original["cot_text"] == omni.get("cot_text")
+    omni_with_reference_kv["cot_equal_ref"] = original["cot_text"] == omni_with_reference_kv.get("cot_text")
 
     _print_section("run summary")
     _print_run_summary("original", original, ade=original_ade)
-    _print_run_summary("omni", omni, ade=omni_ade)
+    _print_run_summary("omni_with_reference_kv", omni_with_reference_kv, ade=omni_with_reference_kv_ade)
 
     _print_section("metric deltas")
-    print(f"omni vs original minADE delta={abs(original_ade - omni_ade):.6f}m")
+    print(
+        "omni_with_reference_kv vs original "
+        f"minADE delta={abs(original_ade - omni_with_reference_kv_ade):.6f}m"
+    )
 
     _print_section("tensor compare")
-    compare_tensors("pred_xyz", original["pred_xyz"], omni["pred_xyz"])
-    compare_tensors("pred_rot", original["pred_rot"], omni["pred_rot"])
+    compare_tensors("pred_xyz_omni_with_reference_kv", original["pred_xyz"], omni_with_reference_kv["pred_xyz"])
+    compare_tensors("pred_rot_omni_with_reference_kv", original["pred_rot"], omni_with_reference_kv["pred_rot"])
 
     _print_section("structured dump compare")
     actual_stage1_dump = actual_stage1_transition_dump_path(dump_dir)
     if actual_stage1_dump.is_file():
         print_dump_compare_report(
             base_dir=dump_dir,
-            comparison_target="fixed_x0_stage1_transition",
+            comparison_target="fixed_kv_x0_stage1_transition",
             lhs_path=reference_stage1_dump,
             rhs_path=actual_stage1_dump,
             keys=[
@@ -135,7 +145,7 @@ async def main() -> None:
     if reference_rollout_context.is_file() and actual_rollout_context.is_file():
         print_dump_compare_report(
             base_dir=dump_dir,
-            comparison_target="fixed_x0_stage1_rollout_context",
+            comparison_target="fixed_kv_x0_stage1_rollout_context",
             lhs_path=reference_rollout_context,
             rhs_path=actual_rollout_context,
             keys=[
@@ -152,7 +162,7 @@ async def main() -> None:
     if reference_rollout_step0.is_file() and actual_rollout_step0.is_file():
         print_dump_compare_report(
             base_dir=dump_dir,
-            comparison_target="fixed_x0_stage1_rollout_step",
+            comparison_target="fixed_kv_x0_stage1_rollout_step",
             lhs_path=reference_rollout_step0,
             rhs_path=actual_rollout_step0,
             keys=["x", "t", "future_token_embeds", "last_hidden", "pred"],
@@ -163,7 +173,7 @@ async def main() -> None:
     if reference_action_in_proj_internal.is_file() and actual_action_in_proj_internal.is_file():
         print_dump_compare_report(
             base_dir=dump_dir,
-            comparison_target="fixed_x0_action_in_proj_internal",
+            comparison_target="fixed_kv_x0_action_in_proj_internal",
             lhs_path=reference_action_in_proj_internal,
             rhs_path=actual_action_in_proj_internal,
             keys=[
@@ -200,7 +210,7 @@ async def main() -> None:
     if reference_expert_internal.is_file() and actual_expert_internal.is_file():
         print_dump_compare_report(
             base_dir=dump_dir,
-            comparison_target="fixed_x0_expert_internal",
+            comparison_target="fixed_kv_x0_expert_internal",
             lhs_path=reference_expert_internal,
             rhs_path=actual_expert_internal,
             keys=[
@@ -215,6 +225,7 @@ async def main() -> None:
         )
 
     _print_section("artifacts")
+    print(f"reference_kv_path={dumped_reference_kv_cache_path(dump_dir)}")
     print(f"dump_dir={dump_dir}")
 
 

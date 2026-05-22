@@ -1230,7 +1230,7 @@ class AsyncOmniEngine:
                     sampling_params=params,
                     tokenizer=getattr(self.input_processor.renderer, "tokenizer", None),
                     model_path=self.model,
-                    lora_request=lora_request,
+                    # lora_request=lora_request,
                 )
             # TODO (Peiqi): add this for Qwen3-TTS only. Other models don't have
             # additional_information field in the prompt.

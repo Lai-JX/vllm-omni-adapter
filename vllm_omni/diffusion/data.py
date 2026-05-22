@@ -575,8 +575,10 @@ class OmniDiffusionConfig:
 
     def __post_init__(self):
         # TODO: remove hard code
+        logger.info(f"Settling master port for distributed inference. self.master_port={self.master_port}")
         initial_master_port = (self.master_port or 30005) + random.randint(0, 100)
         self.master_port = self.settle_port(initial_master_port, 37)
+        logger.info(f"Using master port {self.master_port} for distributed inference")
 
         if isinstance(self.profiler_config, dict):
             from vllm.config import ProfilerConfig

@@ -73,6 +73,32 @@ class OmniGPUModelRunner(GPUModelRunner):
             extra=extra,
         )
 
+    def _filter_supported_kwargs(self, func: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Pass only kwargs accepted by the target callable.
+
+        This keeps Omni extensions working for models that opt into extra
+        M-RoPE metadata while remaining compatible with upstream models whose
+        signatures only accept the base ``mm_features`` argument.
+        """
+        try:
+            signature = inspect.signature(func)
+        except (TypeError, ValueError):
+            return kwargs
+
+        parameters = signature.parameters.values()
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters):
+            return kwargs
+
+        accepted_names = {
+            param.name
+            for param in parameters
+            if param.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        }
+        return {name: value for name, value in kwargs.items() if name in accepted_names}
+
     def initialize_metadata_builders(self, kv_cache_config, kernel_block_sizes):
         """Override to fix scheduler_metadata buffer size for FA3 + CUDA graph.
 
@@ -193,6 +219,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 kwargs["target_h"] = target_h
             if target_w is not None:
                 kwargs["target_w"] = target_w
+            kwargs = self._filter_supported_kwargs(self.model.get_mrope_input_positions, kwargs)
             req_state.mrope_positions, req_state.mrope_position_delta = self.model.get_mrope_input_positions(
                 req_state.prompt_token_ids,
                 **kwargs,

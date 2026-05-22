@@ -169,7 +169,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.transfer_triggered_requests.add(request.request_id)
             self._mark_request_for_kv_transfer(
                 request.request_id,
-                request.num_computed_tokens,
+                confirmed_computed,
             )
             return False
 

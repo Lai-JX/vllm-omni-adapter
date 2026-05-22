@@ -364,10 +364,15 @@ class UnicycleAccelCurvatureActionSpace(ActionSpace):
         kappa_ridge: float = 1e-4,
     ):
         super().__init__()
-        self.register_buffer("accel_mean", torch.tensor(accel_mean), persistent=False)
-        self.register_buffer("accel_std", torch.tensor(accel_std), persistent=False)
-        self.register_buffer("curvature_mean", torch.tensor(curvature_mean), persistent=False)
-        self.register_buffer("curvature_std", torch.tensor(curvature_std), persistent=False)
+        # self.register_buffer("accel_mean", torch.tensor(accel_mean), persistent=False)
+        # self.register_buffer("accel_std", torch.tensor(accel_std), persistent=False)
+        # self.register_buffer("curvature_mean", torch.tensor(curvature_mean), persistent=False)
+        # self.register_buffer("curvature_std", torch.tensor(curvature_std), persistent=False)
+        self.accel_mean = float(accel_mean)
+        self.accel_std = float(accel_std)
+        self.curvature_mean = float(curvature_mean)
+        self.curvature_std = float(curvature_std)
+
         self.accel_bounds = accel_bounds
         self.curvature_bounds = curvature_bounds
         self.dt = dt
@@ -443,8 +448,12 @@ class UnicycleAccelCurvatureActionSpace(ActionSpace):
         v = dxy_theta_to_v(dxy=dxy, theta=theta, v0=t0_states["v"], dt=self.dt, v_lambda=self.v_lambda, v_ridge=self.v_ridge)
         accel = self._v_to_a(v)
         kappa = self._theta_v_a_to_kappa(theta, v, accel)
-        accel = (accel - self.accel_mean.to(accel.device)) / self.accel_std.to(accel.device)
-        kappa = (kappa - self.curvature_mean.to(kappa.device)) / self.curvature_std.to(kappa.device)
+        accel_mean = torch.as_tensor(self.accel_mean, device=accel.device, dtype=accel.dtype)
+        accel_std = torch.as_tensor(self.accel_std, device=accel.device, dtype=accel.dtype)
+        kappa_mean = torch.as_tensor(self.curvature_mean, device=kappa.device, dtype=kappa.dtype)
+        kappa_std = torch.as_tensor(self.curvature_std, device=kappa.device, dtype=kappa.dtype)
+        accel = (accel - accel_mean) / accel_std
+        kappa = (kappa - kappa_mean) / kappa_std
         action = torch.stack([accel, kappa], dim=-1)
         if not output_all_states:
             return action
@@ -458,8 +467,12 @@ class UnicycleAccelCurvatureActionSpace(ActionSpace):
         t0_states: dict[str, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         accel, kappa = action[..., 0], action[..., 1]
-        accel = accel * self.accel_std.to(accel.device) + self.accel_mean.to(accel.device)
-        kappa = kappa * self.curvature_std.to(kappa.device) + self.curvature_mean.to(kappa.device)
+        accel_mean = torch.as_tensor(self.accel_mean, device=accel.device, dtype=accel.dtype)
+        accel_std = torch.as_tensor(self.accel_std, device=accel.device, dtype=accel.dtype)
+        kappa_mean = torch.as_tensor(self.curvature_mean, device=kappa.device, dtype=kappa.dtype)
+        kappa_std = torch.as_tensor(self.curvature_std, device=kappa.device, dtype=kappa.dtype)
+        accel = accel * accel_std + accel_mean
+        kappa = kappa * kappa_std + kappa_mean
         if t0_states is None:
             t0_states = self.estimate_t0_states(traj_history_xyz, traj_history_rot)
         v0 = t0_states["v"]
@@ -519,13 +532,22 @@ class MLPEncoder(nn.Module):
 class FourierEncoderV2(nn.Module):
     def __init__(self, dim: int, max_freq: float = 100.0):
         super().__init__()
-        half = dim // 2
-        freqs = torch.logspace(0, math.log10(max_freq), steps=half)
         self.out_dim = dim
-        self.register_buffer("freqs", freqs[None, :], persistent=False)
+        self.half = dim // 2
+        self.max_freq = float(max_freq)
+
+    def _build_freqs(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.logspace(
+            0,
+            math.log10(self.max_freq),
+            steps=self.half,
+            device=x.device,
+            dtype=x.dtype,
+        )[None, :]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        arg = x[..., None] * self.freqs * 2 * torch.pi
+        freqs = self._build_freqs(x)
+        arg = x[..., None] * freqs * 2 * torch.pi
         return torch.cat([torch.sin(arg), torch.cos(arg)], -1) * math.sqrt(2)
 
 

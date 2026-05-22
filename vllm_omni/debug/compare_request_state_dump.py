@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -11,8 +12,31 @@ import numpy as np
 import torch
 
 
+def _decode_tensor_like(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        if value.get("__tensor__") is True:
+            data = value.get("data")
+            dtype_name = str(value.get("dtype", "torch.float32"))
+            dtype = getattr(torch, dtype_name.removeprefix("torch."), None)
+            if dtype is None:
+                return torch.tensor(data)
+            return torch.tensor(data, dtype=dtype)
+        if value.get("__ndarray__") is True:
+            data = value.get("data")
+            dtype_name = str(value.get("dtype", "float32"))
+            dtype = getattr(np, dtype_name, None)
+            if dtype is None:
+                return np.asarray(data)
+            return np.asarray(data, dtype=dtype)
+        return {str(k): _decode_tensor_like(v) for k, v in value.items()}
+    if _is_sequence(value):
+        return [_decode_tensor_like(v) for v in value]
+    return value
+
+
 def _load_dump(path: Path) -> dict[str, Any]:
-    data = torch.load(path, map_location="cpu", weights_only=False)
+    data = json.loads(path.read_text())
+    data = _decode_tensor_like(data)
     if not isinstance(data, dict):
         raise TypeError(f"Expected dict payload in {path}, got {type(data)!r}")
     return data

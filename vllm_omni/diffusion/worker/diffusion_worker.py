@@ -149,8 +149,8 @@ class DiffusionWorker:
             set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config),
             set_current_vllm_config(self.vllm_config),
         ):
+            logger.info(f"Worker {self.rank}: Initialized device and distributed environment. Port: {self.od_config.master_port}, ENV VARS: { {k: os.environ[k] for k in ['MASTER_ADDR', 'MASTER_PORT', 'LOCAL_RANK', 'RANK', 'WORLD_SIZE']} }")
             init_distributed_environment(world_size=world_size, rank=rank)
-            logger.info(f"Worker {self.rank}: Initialized device and distributed environment.")
 
             parallel_config = self.od_config.parallel_config
             initialize_model_parallel(

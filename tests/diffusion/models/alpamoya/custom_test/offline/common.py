@@ -4,18 +4,20 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+REPO_ROOT = Path(__file__).resolve().parents[6]
+WORKSPACE_ROOT = REPO_ROOT.parent
+# LOCAL_VLLM_ROOT = WORKSPACE_ROOT / "vllm"
+ALPAMAYO_SRC = WORKSPACE_ROOT / "alpamayo1.5" / "src"
+
+for path in (REPO_ROOT, ALPAMAYO_SRC):
+    path_str = str(path)
+    if path.is_dir() and path_str not in sys.path:
+        sys.path.insert(0, path_str)
+
 import torch
 import yaml
 from PIL import Image
 from vllm import SamplingParams
-
-REPO_ROOT = Path(__file__).resolve().parents[6]
-ALPAMAYO_SRC = REPO_ROOT.parent / "alpamayo1.5" / "src"
-
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-if ALPAMAYO_SRC.is_dir() and str(ALPAMAYO_SRC) not in sys.path:
-    sys.path.insert(0, str(ALPAMAYO_SRC))
 
 from alpamayo1_5 import helper
 from alpamayo1_5.load_physical_aiavdataset_local import load_physical_aiavdataset
@@ -249,6 +251,7 @@ def build_two_stage_yaml(
     src_yaml_path: str = YAML_PATH,
     *,
     batch_size: int = 1,
+    attention_backend: str | None = None,
 ) -> str:
     with open(src_yaml_path, "r") as f:
         config = yaml.safe_load(f)
@@ -262,6 +265,8 @@ def build_two_stage_yaml(
     stage0_engine_args["max_num_seqs"] = resolved_batch_size
     stage0_engine_args["max_num_batched_tokens"] = 4096 * resolved_batch_size
     stage0_engine_args["max_model_len"] = 4096
+    if attention_backend is not None:
+        stage0_engine_args["attention_backend"] = attention_backend
     stage0["engine_args"] = stage0_engine_args
 
     stage1_engine_args = dict(stage1.get("engine_args") or {})

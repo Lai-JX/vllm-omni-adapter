@@ -3,10 +3,12 @@
 """Unified OmniConnector and KV cache transfer management."""
 
 import json
+import os
 import struct
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -32,6 +34,64 @@ from .utils.kv_utils import (
 logger = init_logger(__name__)
 
 LayerKV = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
+
+_KV_PROBE_ENV = "VLLM_OMNI_ALPAMAYO_STAGE1_DUMP_DIR"
+
+
+def _kv_probe_enabled() -> bool:
+    return bool(os.environ.get(_KV_PROBE_ENV, "").strip())
+
+
+def _summarize_probe_tensor(tensor: torch.Tensor | None) -> dict[str, object] | None:
+    if tensor is None:
+        return None
+    detached = tensor.detach().to(dtype=torch.float32)
+    flat = detached.reshape(-1)
+    return {
+        "shape": tuple(tensor.shape),
+        "dtype": str(tensor.dtype),
+        "mean": float(detached.mean().item()) if detached.numel() else 0.0,
+        "std": float(detached.std(unbiased=False).item()) if detached.numel() else 0.0,
+        "abs_max": float(detached.abs().max().item()) if detached.numel() else 0.0,
+        "first": float(flat[0].item()) if flat.numel() else 0.0,
+        "last": float(flat[-1].item()) if flat.numel() else 0.0,
+    }
+
+
+def _dump_sender_kv_probe(
+    *,
+    req_id: str,
+    transfer_req_id: str,
+    seq_len: int,
+    block_ids: list[int],
+    block_size: int,
+    cache_dtype: str,
+    num_layers: int,
+    layer_probe: list[dict[str, Any]],
+    custom_metadata: dict[str, Any] | None,
+) -> None:
+    if not _kv_probe_enabled():
+        return
+    try:
+        from vllm_omni.debug.alpamayo_stage1_rollout_dump import maybe_dump_alpamayo_stage1_rollout
+
+        maybe_dump_alpamayo_stage1_rollout(
+            req_id=transfer_req_id,
+            phase="stage0_kv_sender_probe",
+            payload={
+                "request_id": req_id,
+                "transfer_request_id": transfer_req_id,
+                "seq_len": int(seq_len),
+                "block_ids": list(block_ids),
+                "block_size": int(block_size),
+                "cache_dtype": str(cache_dtype),
+                "num_layers": int(num_layers),
+                "layer_probe": layer_probe,
+                "custom_metadata": custom_metadata or {},
+            },
+        )
+    except Exception:
+        logger.exception("Failed to dump sender-side KV probe for request %s", transfer_req_id)
 
 _SAFE_TORCH_DTYPES = {
     name: dtype
@@ -803,13 +863,18 @@ class OmniKVTransferManager:
 
                 # Extract KV cache from GPU blocks and keep it on-device when
                 # possible so raw-data connectors can use the fast path.
+                transfer_req_id = request_id_resolver(req_id) if request_id_resolver else req_id
                 kv_data = self._extract_kv_cache(
-                    req_id, block_ids, seq_len, kv_caches, block_size, cache_dtype, custom_metadata
+                    req_id,
+                    block_ids,
+                    seq_len,
+                    kv_caches,
+                    block_size,
+                    cache_dtype,
+                    custom_metadata,
+                    transfer_req_id,
                 )
                 if kv_data:
-                    # Resolve global request ID if available
-                    transfer_req_id = request_id_resolver(req_id) if request_id_resolver else req_id
-
                     # Transfer to downstream stage via connector
                     self._transfer_kv_cache(kv_data, transfer_req_id)
                     t_transfer_done = time.time()
@@ -831,6 +896,7 @@ class OmniKVTransferManager:
         block_size: int,
         cache_dtype: str,
         custom_metadata: dict[str, Any] | None = None,
+        transfer_req_id: str | None = None,
     ) -> KVCacheTransferData | None:
         """Extract KV cache from GPU blocks for a single request.
 
@@ -852,6 +918,7 @@ class OmniKVTransferManager:
         num_layers = len(kv_caches)
         key_cache: list[torch.Tensor | None] = [None] * num_layers
         value_cache: list[torch.Tensor | None] = [None] * num_layers
+        layer_probe: list[dict[str, Any]] = [] if _kv_probe_enabled() else []
 
         for layer_idx, layer_kv in enumerate(kv_caches):
             kv_pair = normalize_layer_kv(layer_kv, req_id=req_id, layer_idx=layer_idx)
@@ -869,6 +936,23 @@ class OmniKVTransferManager:
             max_block = min(key_blocks.shape[0], value_blocks.shape[0]) - 1
             valid_ids = [bid for bid in block_ids if 0 <= bid <= max_block]
             if not valid_ids:
+                if _kv_probe_enabled():
+                    layer_probe.append(
+                        {
+                            "layer_index": layer_idx,
+                            "key_blocks": _summarize_probe_tensor(key_blocks),
+                            "value_blocks": _summarize_probe_tensor(value_blocks),
+                            "max_block": int(max_block),
+                            "valid_ids": [],
+                            "valid_id_count": 0,
+                            "selected_k": None,
+                            "selected_v": None,
+                            "flat_k_before_trunc": None,
+                            "flat_v_before_trunc": None,
+                            "flat_k_after_trunc": None,
+                            "flat_v_after_trunc": None,
+                        }
+                    )
                 continue
 
             # Extract and reshape: [n_blocks, block_size, n_heads, head_dim]
@@ -877,6 +961,8 @@ class OmniKVTransferManager:
             selected_v = value_blocks[valid_ids]
             flat_k = selected_k.flatten(0, 1)
             flat_v = selected_v.flatten(0, 1)
+            flat_k_before_trunc = flat_k
+            flat_v_before_trunc = flat_v
             if seq_len < flat_k.shape[0]:
                 flat_k = flat_k[:seq_len]
                 flat_v = flat_v[:seq_len]
@@ -884,8 +970,38 @@ class OmniKVTransferManager:
             key_cache[layer_idx] = flat_k.detach().contiguous()
             value_cache[layer_idx] = flat_v.detach().contiguous()
 
+            if _kv_probe_enabled():
+                layer_probe.append(
+                    {
+                        "layer_index": layer_idx,
+                        "key_blocks": _summarize_probe_tensor(key_blocks),
+                        "value_blocks": _summarize_probe_tensor(value_blocks),
+                        "max_block": int(max_block),
+                        "valid_ids": list(valid_ids),
+                        "valid_id_count": len(valid_ids),
+                        "selected_k": _summarize_probe_tensor(selected_k),
+                        "selected_v": _summarize_probe_tensor(selected_v),
+                        "flat_k_before_trunc": _summarize_probe_tensor(flat_k_before_trunc),
+                        "flat_v_before_trunc": _summarize_probe_tensor(flat_v_before_trunc),
+                        "flat_k_after_trunc": _summarize_probe_tensor(key_cache[layer_idx]),
+                        "flat_v_after_trunc": _summarize_probe_tensor(value_cache[layer_idx]),
+                    }
+                )
+
         if not any(k is not None for k in key_cache):
             return None
+
+        _dump_sender_kv_probe(
+            req_id=req_id,
+            transfer_req_id=transfer_req_id or req_id,
+            seq_len=seq_len,
+            block_ids=block_ids,
+            block_size=block_size,
+            cache_dtype=cache_dtype,
+            num_layers=num_layers,
+            layer_probe=layer_probe,
+            custom_metadata=custom_metadata,
+        )
 
         return KVCacheTransferData(
             request_id=req_id,

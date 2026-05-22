@@ -24,6 +24,8 @@ from vllm.outputs import RequestOutput
 import common as ct
 from tests.diffusion.models.alpamoya.custom_test.offline.alpamoya_compare_original import (
     REQUEST_ID,
+    actual_request_state_dump_path,
+    actual_stage1_transition_dump_path,
     build_fixed_initial_noise_x0,
     build_stage_params,
     capture_stage1_transition_dump,
@@ -198,7 +200,7 @@ async def run_omni_no_rewrite(
         os.environ["VLLM_OMNI_REQUEST_DUMP_PHASES"] = "request_state_initialized,request_state_batched"
         os.environ["VLLM_OMNI_ALPAMAYO_STAGE1_DUMP_DIR"] = str(dump_dir)
         os.environ["VLLM_OMNI_ALPAMAYO_STAGE1_DUMP_REQ_IDS"] = REQUEST_ID
-        os.environ["VLLM_OMNI_ALPAMAYO_STAGE1_DUMP_PHASES"] = "stage1_rollout_context,stage1_rollout_step0"
+        os.environ["VLLM_OMNI_ALPAMAYO_STAGE1_DUMP_PHASES"] = "stage1_transition,stage1_rollout_context,stage1_rollout_step"
 
     omni = AsyncOmni(model=ct.MODEL_PATH, stage_configs_path=yaml_path)
     try:
@@ -357,8 +359,8 @@ async def main() -> None:
     print(f"omni minADE: {omni_ade:.6f} meters")
     print(f"minADE delta: {abs(original_ade - omni_ade):.6f} meters")
 
-    actual_initialized = dump_dir / REQUEST_ID / "request_state_initialized.pt"
-    actual_batched = dump_dir / REQUEST_ID / "request_state_batched.pt"
+    actual_initialized = actual_request_state_dump_path(dump_dir, "request_state_initialized")
+    actual_batched = actual_request_state_dump_path(dump_dir, "request_state_batched")
     if actual_initialized.is_file():
         print_dump_compare_report(
             title="REQUEST STATE INITIALIZED DUMP COMPARE",
@@ -387,7 +389,7 @@ async def main() -> None:
             ],
         )
 
-    actual_stage1_dump = dump_dir / REQUEST_ID / "actual_stage1_transition.pt"
+    actual_stage1_dump = actual_stage1_transition_dump_path(dump_dir)
     if actual_stage1_dump.is_file():
         print_dump_compare_report(
             title="NO REWRITE STAGE1 TRANSITION DUMP COMPARE",

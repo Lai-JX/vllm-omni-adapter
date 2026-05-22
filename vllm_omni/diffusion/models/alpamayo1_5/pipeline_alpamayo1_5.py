@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time as _time
 from contextlib import nullcontext
 from pathlib import Path
@@ -269,6 +270,114 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
         return t
 
     @staticmethod
+    def _summarize_cache_tensor(tensor: torch.Tensor | None) -> dict[str, object] | None:
+        if tensor is None:
+            return None
+        detached = tensor.detach().to(dtype=torch.float32)
+        flat = detached.reshape(-1)
+        return {
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "mean": float(detached.mean().item()) if detached.numel() else 0.0,
+            "std": float(detached.std(unbiased=False).item()) if detached.numel() else 0.0,
+            "abs_max": float(detached.abs().max().item()) if detached.numel() else 0.0,
+            "first": float(flat[0].item()) if flat.numel() else 0.0,
+            "last": float(flat[-1].item()) if flat.numel() else 0.0,
+        }
+
+    @classmethod
+    def _summarize_prompt_cache(cls, prompt_cache: DynamicCache | None) -> dict[str, object] | None:
+        if prompt_cache is None:
+            return None
+        layers = getattr(prompt_cache, "layers", None)
+        if not isinstance(layers, list):
+            return None
+        return {
+            "num_layers": len(layers),
+            "seq_len": int(prompt_cache.get_seq_length()),
+            "layers": [
+                {
+                    "layer_index": layer_idx,
+                    "key": cls._summarize_cache_tensor(getattr(layer, "keys", None)),
+                    "value": cls._summarize_cache_tensor(getattr(layer, "values", None)),
+                }
+                for layer_idx, layer in enumerate(layers)
+            ],
+        }
+
+    @staticmethod
+    def _serialize_prompt_cache(prompt_cache: DynamicCache | None) -> SimpleNamespace | None:
+        if prompt_cache is None:
+            return None
+        layers = getattr(prompt_cache, "layers", None)
+        if not isinstance(layers, list):
+            return None
+        return SimpleNamespace(
+            key_cache=[
+                None
+                if getattr(layer, "keys", None) is None
+                else layer.keys.detach().cpu().contiguous()
+                for layer in layers
+            ],
+            value_cache=[
+                None
+                if getattr(layer, "values", None) is None
+                else layer.values.detach().cpu().contiguous()
+                for layer in layers
+            ],
+        )
+
+    @staticmethod
+    def _maybe_dump_prompt_cache(
+        req_id: str,
+        prompt_cache: DynamicCache | None,
+        *,
+        call_index: int,
+        sample_index: int,
+    ) -> None:
+        dump_root = os.environ.get("VLLM_OMNI_ALPAMAYO_KV_DEBUG_DIR")
+        if not dump_root or prompt_cache is None:
+            return
+        try:
+            serialized = Alpamayo1_5TrajectoryPipeline._serialize_prompt_cache(prompt_cache)
+            if serialized is None:
+                return
+            req_dir = Path(dump_root) / req_id
+            req_dir.mkdir(parents=True, exist_ok=True)
+            dump_path = req_dir / (
+                f"stage0_kv_cache.call{call_index:03d}.sample{sample_index:03d}.pt"
+            )
+            meta_path = req_dir / (
+                f"stage0_kv_cache.call{call_index:03d}.sample{sample_index:03d}.meta.json"
+            )
+            payload = {
+                "req_id": req_id,
+                "call_index": int(call_index),
+                "sample_index": int(sample_index),
+                "seq_len": int(prompt_cache.get_seq_length()),
+                "num_layers": len(serialized.key_cache),
+                "key_cache": serialized.key_cache,
+                "value_cache": serialized.value_cache,
+            }
+            torch.save(payload, dump_path)
+            meta_path.write_text(
+                json.dumps(
+                    {
+                        "req_id": req_id,
+                        "call_index": int(call_index),
+                        "sample_index": int(sample_index),
+                        "seq_len": int(prompt_cache.get_seq_length()),
+                        "num_layers": len(serialized.key_cache),
+                        "dump_path": str(dump_path),
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Failed to dump Alpamayo prompt cache for %s: %s", req_id, exc)
+
+    @staticmethod
     def _linear_rollout(history: torch.Tensor, steps: int) -> torch.Tensor:
         if history.shape[1] >= 2:
             delta = history[:, -1, :] - history[:, -2, :]
@@ -460,7 +569,10 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
 
             legacy_cache.append((k.to(device=device).contiguous(), v.to(device=device).contiguous()))
 
-        return DynamicCache.from_legacy_cache(tuple(legacy_cache))
+        legacy_cache_tuple = tuple(legacy_cache)
+        if hasattr(DynamicCache, "from_legacy_cache"):
+            return DynamicCache.from_legacy_cache(legacy_cache_tuple)
+        return DynamicCache(legacy_cache_tuple)
 
     @staticmethod
     def _select_transferred_kv_sample(transferred_kv: Any, sample_idx: int | None) -> Any:
@@ -493,6 +605,26 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             value_cache=sliced_value_cache,
         )
 
+    @staticmethod
+    def _maybe_load_override_prompt_cache() -> Any | None:
+        kv_path = os.environ.get("VLLM_OMNI_ALPAMAYO_OVERRIDE_KV_PATH")
+        if not kv_path:
+            return None
+        path = Path(kv_path)
+        if not path.is_file():
+            raise RuntimeError(f"Override KV cache file not found: {path}")
+        payload = torch.load(path, map_location="cpu")
+        key_cache = payload.get("key_cache") if isinstance(payload, dict) else None
+        value_cache = payload.get("value_cache") if isinstance(payload, dict) else None
+        if not isinstance(key_cache, list) or not isinstance(value_cache, list):
+            raise RuntimeError(f"Invalid override KV cache payload: {path}")
+        logger.info(
+            "Loaded override stage-0 KV cache from %s with %d layers",
+            path,
+            len(key_cache),
+        )
+        return SimpleNamespace(key_cache=key_cache, value_cache=value_cache)
+
     def _prepare_rollout_context(
         self,
         info: dict[str, Any],
@@ -506,7 +638,9 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
         torch.Tensor | None,
         torch.Tensor | None,
     ]:
-        transferred_kv = getattr(sampling_params, "past_key_values", None)
+        transferred_kv = self._maybe_load_override_prompt_cache()
+        if transferred_kv is None:
+            transferred_kv = getattr(sampling_params, "past_key_values", None)
         if transferred_kv is None:
             raise RuntimeError(
                 "Missing stage-0 KV cache: sampling_params.past_key_values is None."
@@ -726,6 +860,14 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             prefix_mask,
             initial_noise_x0,
         ) = prepared
+        call_index = int(info.get("stage1_rollout_call_index", 0) or 0)
+        sample_index = int(info.get("stage1_rollout_sample_index", 0) or 0)
+        self._maybe_dump_prompt_cache(
+            req_id,
+            prompt_cache,
+            call_index=call_index,
+            sample_index=sample_index,
+        )
         prefill_seq_len = prompt_cache.get_seq_length()
         n_diffusion_tokens = self.action_space.get_action_space_dims()[0]
         expected_x_shape = tuple(int(dim) for dim in self.diffusion.x_dims)
@@ -756,11 +898,14 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
         maybe_dump_alpamayo_stage1_rollout(
             req_id=req_id,
             phase="stage1_rollout_context",
+            call_index=call_index,
+            sample_index=sample_index,
             payload={
                 "sequence_tensor": sequence_tensor,
                 "rope_deltas": rope_deltas,
                 "prefix_mask": prefix_mask,
                 "prefill_seq_len": int(prefill_seq_len),
+                "prompt_cache_summary": self._summarize_prompt_cache(prompt_cache),
                 "offset": offset,
                 "position_ids": position_ids,
                 "attention_mask": attention_mask,
@@ -784,6 +929,58 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
         expert_dtype = expert_param.dtype if expert_param is not None else hist_xyz.dtype
         first_step_dumped = False
 
+        def _action_in_proj_internal_payload(
+            raw_x: torch.Tensor,
+            raw_t: torch.Tensor,
+            autocast_ctx: Any,
+        ) -> dict[str, torch.Tensor]:
+            x_local = raw_x.to(device=hist_xyz.device)
+            t_local = raw_t.to(device=hist_xyz.device)
+            _, num_steps_local, _ = x_local.shape
+            debug: dict[str, torch.Tensor] = {
+                "x_in": raw_x,
+                "t_in": raw_t,
+            }
+            with autocast_ctx:
+                action_branches = []
+                for branch_index, encoder in enumerate(self.action_in_proj.sinus):
+                    action_input = x_local[:, :, branch_index]
+                    debug[f"action_input_{branch_index}"] = action_input
+                    freqs = encoder._build_freqs(action_input)
+                    debug[f"freqs_action_{branch_index}"] = freqs
+                    branch_out = encoder(action_input)
+                    debug[f"fourier_action_{branch_index}"] = branch_out
+                    action_branches.append(branch_out)
+                action_feats = torch.cat(action_branches, dim=-1)
+                debug["action_feats"] = action_feats
+
+                timestep_scalar = t_local[..., -1]
+                debug["timestep_scalar"] = timestep_scalar
+                timestep_freqs = self.action_in_proj.timestep_fourier_encoder._build_freqs(
+                    timestep_scalar,
+                )
+                debug["freqs_t"] = timestep_freqs
+                timestep_single = self.action_in_proj.timestep_fourier_encoder(timestep_scalar)
+                debug["fourier_t"] = timestep_single
+                timestep_feats = timestep_single.repeat(1, num_steps_local, 1)
+                debug["timestep_feats"] = timestep_feats
+
+                fused = torch.cat((action_feats, timestep_feats), dim=-1)
+                debug["concat_before_mlp"] = fused
+                mlp_in = fused.flatten(0, 1)
+                debug["mlp_in"] = mlp_in
+                current = mlp_in
+                for layer_index, layer in enumerate(self.action_in_proj.encoder.trunk):
+                    current = layer(current)
+                    debug[f"mlp_layer_{layer_index:02d}"] = current
+                debug["encoder_out"] = current
+                reshaped = current.reshape(total_samples, n_diffusion_tokens, -1)
+                debug["encoder_out_reshaped"] = reshaped
+                norm_out = self.action_in_proj.norm(reshaped)
+                debug["norm_out"] = norm_out
+                debug["future_token_embeds"] = norm_out
+            return debug
+
         def step_fn(*, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
             nonlocal first_step_dumped
             raw_x = x
@@ -795,6 +992,7 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             if hist_xyz.device.type == "cuda" and expert_dtype in (torch.float16, torch.bfloat16):
                 autocast_ctx = torch.autocast(device_type="cuda", dtype=expert_dtype)
 
+            prompt_cache_summary_before_expert = self._summarize_prompt_cache(prompt_cache)
             with autocast_ctx:
                 future_token_embeds = self.action_in_proj(x, t)
                 if future_token_embeds.dim() == 2:
@@ -807,6 +1005,7 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
                     use_cache=True,
                     **forward_kwargs,
                 )
+            prompt_cache_summary_after_expert = self._summarize_prompt_cache(prompt_cache)
             prompt_cache.crop(prefill_seq_len)
             last_hidden = expert_out.last_hidden_state[:, -n_diffusion_tokens:]
             with autocast_ctx:
@@ -817,7 +1016,10 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             if not first_step_dumped:
                 maybe_dump_alpamayo_stage1_rollout(
                     req_id=req_id,
-                    phase="stage1_rollout_step0",
+                    phase="stage1_rollout_step",
+                    call_index=call_index,
+                    sample_index=sample_index,
+                    step_index=0,
                     payload={
                         "x": raw_x,
                         "t": raw_t,
@@ -826,6 +1028,36 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
                         "future_token_embeds": future_token_embeds,
                         "last_hidden": last_hidden,
                         "pred": pred,
+                    },
+                )
+                maybe_dump_alpamayo_stage1_rollout(
+                    req_id=req_id,
+                    phase="action_in_proj_internal",
+                    call_index=call_index,
+                    sample_index=sample_index,
+                    step_index=0,
+                    payload=_action_in_proj_internal_payload(
+                        raw_x=raw_x,
+                        raw_t=raw_t,
+                        autocast_ctx=autocast_ctx,
+                    ),
+                )
+                maybe_dump_alpamayo_stage1_rollout(
+                    req_id=req_id,
+                    phase="expert_internal",
+                    call_index=call_index,
+                    sample_index=sample_index,
+                    step_index=0,
+                    payload={
+                        "future_token_embeds": future_token_embeds,
+                        "position_ids": position_ids,
+                        "attention_mask": attention_mask,
+                        "prompt_cache_seq_len": int(prompt_cache.get_seq_length()),
+                        "prompt_cache_summary": prompt_cache_summary_before_expert,
+                        "prompt_cache_summary_before_expert": prompt_cache_summary_before_expert,
+                        "prompt_cache_summary_after_expert": prompt_cache_summary_after_expert,
+                        "last_hidden_state": expert_out.last_hidden_state,
+                        "last_hidden": last_hidden,
                     },
                 )
                 first_step_dumped = True
@@ -956,7 +1188,7 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             hist_rot = self._to_tensor(info.get("ego_history_rot"), device=device)
             hist_xyz_ref = self._as_hist_xyz(hist_xyz, device)
             hist_rot_ref = self._as_hist_rot(hist_rot, hist_xyz_ref, device)
-            req_id = str(req.request_ids[0]) if getattr(req, "request_ids", None) else "unknown"
+            req_id = str(getattr(req, "request_id", None) or "unknown")
 
             sample_info = dict(info)
             stage0_sample_index = sample_info.get("stage0_sample_index")
