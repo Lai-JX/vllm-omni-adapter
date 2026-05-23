@@ -749,6 +749,7 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
         prefill_seq_len = prompt_cache.get_seq_length()
         n_diffusion_tokens = self.action_space.get_action_space_dims()[0]
         expected_x_shape = tuple(int(dim) for dim in self.diffusion.x_dims)
+        logger.info(f"X_dims: {(total_samples, *expected_x_shape)}")
         if initial_noise_x0 is not None:
             actual_x_shape = tuple(int(dim) for dim in initial_noise_x0.shape)
             if actual_x_shape != (total_samples, *expected_x_shape):
@@ -892,8 +893,27 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             hist_xyz_rep,
             hist_rot_rep,
         )
-        pred_xyz = pred_xyz.view(num_traj_sets, num_samples, future_steps, 3).detach()
-        pred_rot = pred_rot.view(num_traj_sets, num_samples, future_steps, 3, 3).detach()
+        xyz_batch = pred_xyz.numel() // (future_steps * 3)
+        rot_batch = pred_rot.numel() // (future_steps * 3 * 3)
+        if xyz_batch != rot_batch:
+            raise RuntimeError(
+                f"Mismatched trajectory batch sizes: xyz_batch={xyz_batch}, rot_batch={rot_batch}, "
+                f"future_steps={future_steps}"
+            )
+        actual_batch = xyz_batch
+        expected_batch = num_traj_sets * num_samples
+        actual_num_traj_sets = num_traj_sets
+        actual_num_samples = num_samples
+        if actual_batch != expected_batch:
+            if num_traj_sets > 0 and actual_batch % num_traj_sets == 0:
+                actual_num_samples = actual_batch // num_traj_sets
+            elif num_samples > 0 and actual_batch % num_samples == 0:
+                actual_num_traj_sets = actual_batch // num_samples
+            else:
+                actual_num_traj_sets = 1
+                actual_num_samples = actual_batch
+        pred_xyz = pred_xyz.view(actual_num_traj_sets, actual_num_samples, future_steps, 3).detach()
+        pred_rot = pred_rot.view(actual_num_traj_sets, actual_num_samples, future_steps, 3, 3).detach()
         t_diff_end = _time.time()
         kv_ms = (t_kv_end - t_kv_start) * 1000.0
         diff_ms = (t_diff_end - t_kv_end) * 1000.0
@@ -1009,6 +1029,7 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
                 num_inference_steps=num_inference_steps,
                 guidance_scale=guidance_scale,
             )
+            logger.info(f"Completed diffusion sampling for req_id={req_id}, pred_xyz_shape={pred_xyz.shape} pred_rot_shape={pred_rot.shape}")
 
             output_ids = self._to_padded_long_tensor(
                 sample_info.get("stage0_output_token_ids"),
@@ -1026,7 +1047,18 @@ class Alpamayo1_5TrajectoryPipeline(nn.Module):
             if output_ids.shape[0] == 1 and total_samples > 1:
                 output_ids = output_ids.expand(total_samples, -1).contiguous()
             cot_ids = output_ids[:, -256:] if output_ids.numel() else output_ids
-            cot_ids = cot_ids.view(num_traj_sets, num_samples, -1).detach()
+            cot_batch = cot_ids.shape[0]
+            actual_num_traj_sets = pred_xyz.shape[0]
+            actual_num_samples = pred_xyz.shape[1]
+            if cot_batch != actual_num_traj_sets * actual_num_samples:
+                if cot_batch == 1 and actual_num_traj_sets * actual_num_samples > 1:
+                    cot_ids = cot_ids.expand(actual_num_traj_sets * actual_num_samples, -1).contiguous()
+                else:
+                    raise RuntimeError(
+                        f"Mismatched cot batch size: cot_batch={cot_batch}, "
+                        f"traj_batch={actual_num_traj_sets * actual_num_samples}"
+                    )
+            cot_ids = cot_ids.view(actual_num_traj_sets, actual_num_samples, -1).detach()
 
             pred_xyz_list.append(pred_xyz.cpu())
             pred_rot_list.append(pred_rot.cpu())

@@ -393,7 +393,7 @@ def _build_result_from_output(output, cid, rid, lat):
     kv_s1_prep_ms = float(co.get("kv_tran_s1_prep_ms", co.get("kv_s1_prep_ms", 0)) or 0)
     s1_diffusion_ms = float(co.get("df_ms", co.get("s1_diffusion_ms", 0)) or 0)
     kv_s0_extract_plus_transfer_ms = kv_s0_extract_ms
-    kv_tran_total = kv_s0_extract_plus_transfer_ms + kv_s1_receive_ms + kv_s1_tran_ms + kv_s1_prep_ms
+    kv_tran_total = kv_s0_extract_plus_transfer_ms + kv_s1_receive_ms + kv_s1_prep_ms
     cot_token_ids = co.get("cot_token_ids")
     if isinstance(cot_token_ids, torch.Tensor):
         output_tokens = int(cot_token_ids.numel())

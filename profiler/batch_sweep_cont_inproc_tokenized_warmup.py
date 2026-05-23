@@ -75,6 +75,7 @@ GPU_RECOVERY_TIMEOUT_S = float(os.environ.get("GPU_RECOVERY_TIMEOUT_S", "180.0")
 GPU_RECOVERY_MARGIN_GB = float(os.environ.get("GPU_RECOVERY_MARGIN_GB", "1.0"))
 GENERATE_TRAJ_TOKENS_ENV = os.environ.get("GENERATE_TRAJ_TOKENS", "0").strip()
 SKIP_WARMUP_SAMPLE_ENV = os.environ.get("SKIP_WARMUP_SAMPLE", "0").strip()
+ENABLE_PREFIX_CACHING_ENV = os.environ.get("ENABLE_PREFIX_CACHING", "1").strip()
 
 LOG_DIR = OMNI / "profiler" / "logs" / str(N_TOTAL) / f"async_omni_inproc_tokenized_warmup_trace-gid{PROFILE_GID_ENV}_{int(time.time())}"
 ASYNC_OMNI_LOG_DIR = LOG_DIR / "svc_logs"
@@ -411,7 +412,7 @@ def _build_result_from_output(output, cid, rid, lat):
     kv_s1_prep_ms = float(co.get("kv_tran_s1_prep_ms", co.get("kv_s1_prep_ms", 0)) or 0)
     s1_diffusion_ms = float(co.get("df_ms", co.get("s1_diffusion_ms", 0)) or 0)
     kv_s0_extract_plus_transfer_ms = kv_s0_extract_ms
-    kv_tran_total = kv_s0_extract_plus_transfer_ms + kv_s1_receive_ms + kv_s1_tran_ms + kv_s1_prep_ms
+    kv_tran_total = kv_s0_extract_plus_transfer_ms + kv_s1_receive_ms + kv_s1_prep_ms
     cot_token_ids = co.get("cot_token_ids")
     if isinstance(cot_token_ids, torch.Tensor):
         output_tokens = int(cot_token_ids.numel())
@@ -848,10 +849,16 @@ async def main_async():
         name="SKIP_WARMUP_SAMPLE",
         default=False,
     )
+    enable_prefix_caching = _parse_bool_flag(
+        ENABLE_PREFIX_CACHING_ENV,
+        name="ENABLE_PREFIX_CACHING",
+        default=True,
+    )
     print(
         "Warmup once after engine start: "
         f"sampling_params=formal_request_params, "
-        f"skip_warmup_sample={skip_warmup_sample}"
+        f"skip_warmup_sample={skip_warmup_sample}, "
+        f"enable_prefix_caching={enable_prefix_caching}"
     )
     apply_tokenized_stage0_overrides = _parse_bool_flag(
         GENERATE_TRAJ_TOKENS_ENV,
@@ -860,6 +867,7 @@ async def main_async():
     )
     _build_runtime_stage_config(
         apply_tokenized_stage0_overrides=apply_tokenized_stage0_overrides,
+        enable_prefix_caching=enable_prefix_caching,
     )
     tokenizer = build_alpamayo_stage0_tokenizer(MODEL)
     sampling_params_list = _load_sampling_params_from_yaml(tokenizer)

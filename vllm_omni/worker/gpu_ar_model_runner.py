@@ -621,9 +621,12 @@ class GPUARModelRunner(OmniGPUModelRunner):
             for rid in req_ids_output_copy
         )
         if batch_should_log:
-            profile_now = float(time.time())
-            profile_duration_ms = embed_multimodal_ms
-            profile_start = profile_now - profile_duration_ms / 1000.0
+            embed_start = float(profile_metrics.get("embed_start", 0.0) or 0.0)
+            embed_end = float(profile_metrics.get("embed_end", 0.0) or 0.0)
+            forward_start = float(profile_metrics.get("forward_start", 0.0) or 0.0)
+            forward_end = float(profile_metrics.get("forward_end", 0.0) or 0.0)
+            profile_start = embed_start or forward_start
+            profile_now = forward_end or embed_end or float(time.time())
             for rid in req_ids_output_copy:
                 req_state = self.requests.get(rid)
                 idx = req_id_to_index_output_copy[rid]
@@ -643,6 +646,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
                             "output_tokens": output_tokens,
                             "embed_multimodal_ms": embed_multimodal_ms,
                             "forward_ms": forward_ms,
+                            "embed_start": embed_start,
+                            "embed_end": embed_end,
+                            "forward_start": forward_start,
+                            "forward_end": forward_end,
                             "encoder_cache_hit": int(add_info.get("encoder_cache_hit", 0) or 0),
                             "encoder_cache_miss": int(add_info.get("encoder_cache_miss", 0) or 0),
                             "encoder_cache_skipped": int(add_info.get("encoder_cache_skipped", 0) or 0),

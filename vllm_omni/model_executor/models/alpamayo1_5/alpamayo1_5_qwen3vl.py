@@ -126,13 +126,17 @@ class Alpamayo1_5Qwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration
         should_sync = torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing()
         if should_sync:
             torch.cuda.synchronize()
-        start = time.perf_counter()
+        wall_start = time.time()
+        perf_start = time.perf_counter()
         try:
             return super().embed_multimodal(**kwargs)
         finally:
             if should_sync:
                 torch.cuda.synchronize()
-            self._last_embed_multimodal_ms = (time.perf_counter() - start) * 1000.0
+            wall_end = time.time()
+            self._last_embed_start_time = wall_start
+            self._last_embed_end_time = wall_end
+            self._last_embed_multimodal_ms = (time.perf_counter() - perf_start) * 1000.0
 
     def forward(
         self,
@@ -145,7 +149,8 @@ class Alpamayo1_5Qwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration
         should_sync = torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing()
         if should_sync:
             torch.cuda.synchronize()
-        start = time.perf_counter()
+        wall_start = time.time()
+        perf_start = time.perf_counter()
         try:
             return super().forward(
                 input_ids,
@@ -157,13 +162,24 @@ class Alpamayo1_5Qwen3VLForConditionalGeneration(Qwen3VLForConditionalGeneration
         finally:
             if should_sync:
                 torch.cuda.synchronize()
-            self._last_forward_ms = (time.perf_counter() - start) * 1000.0
+            wall_end = time.time()
+            self._last_forward_start_time = wall_start
+            self._last_forward_end_time = wall_end
+            self._last_forward_ms = (time.perf_counter() - perf_start) * 1000.0
 
     def pop_last_profile_metrics(self) -> dict[str, float]:
         metrics = {
             "embed_multimodal_ms": float(getattr(self, "_last_embed_multimodal_ms", 0.0) or 0.0),
             "forward_ms": float(getattr(self, "_last_forward_ms", 0.0) or 0.0),
+            "embed_start": float(getattr(self, "_last_embed_start_time", 0.0) or 0.0),
+            "embed_end": float(getattr(self, "_last_embed_end_time", 0.0) or 0.0),
+            "forward_start": float(getattr(self, "_last_forward_start_time", 0.0) or 0.0),
+            "forward_end": float(getattr(self, "_last_forward_end_time", 0.0) or 0.0),
         }
         self._last_embed_multimodal_ms = 0.0
         self._last_forward_ms = 0.0
+        self._last_embed_start_time = 0.0
+        self._last_embed_end_time = 0.0
+        self._last_forward_start_time = 0.0
+        self._last_forward_end_time = 0.0
         return metrics
